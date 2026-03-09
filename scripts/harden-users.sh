@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# =============================================================================
+# ==============================================================================
 # harden-users.sh — Account hardening for fresh Debian/Ubuntu systems
-# =============================================================================
+# ==============================================================================
 # Intended for fresh Proxmox LXC containers (Ubuntu 24.04 template).
 # Compatible with Debian 11+ and Ubuntu 22.04+.
 #
@@ -20,12 +20,10 @@
 # reports all-clear and exits without prompting. If a check requires action,
 # the operator is shown the current state, given the rationale, and prompted.
 # Declining a fix is always allowed, but a warning is recorded in the summary.
-# =============================================================================
+# ==============================================================================
 set -euo pipefail
 
-# =============================================================================
-# Argument parsing
-# =============================================================================
+# ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-false}"
 
 for _arg in "$@"; do
@@ -44,9 +42,7 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# =============================================================================
-# Colors
-# =============================================================================
+# ── Colors ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
     RED=$'\e[0;31m';  GREEN=$'\e[0;32m';  YELLOW=$'\e[1;33m'
     BLUE=$'\e[0;34m'; CYAN=$'\e[0;36m';   BOLD=$'\e[1m'
@@ -55,15 +51,14 @@ else
     RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; NC=''
 fi
 
-# =============================================================================
-# Output helpers
-# =============================================================================
-info()  { printf "${CYAN}  >>>  ${NC}%s\n"   "$1"; }
-ok()    { printf "${GREEN}  [+]  ${NC}%s\n"  "$1"; }
-warn()  { printf "${YELLOW}  [!]  ${NC}%s\n" "$1"; }
-err()   { printf "${RED}  [x]  ${NC}%s\n"    "$1" >&2; }
-plain() { printf "        %s\n"              "$1"; }
-die()   { err "$1"; exit 1; }
+# ── Output helpers ────────────────────────────────────────────────────────────
+info()    { printf "${CYAN}  >>>  ${NC}%s\n"   "$1"; }
+ok()      { printf "${GREEN}  [+]  ${NC}%s\n"  "$1"; }
+warn()    { printf "${YELLOW}  [!]  ${NC}%s\n" "$1"; }
+err()     { printf "${RED}  [x]  ${NC}%s\n"    "$1" >&2; }
+plain()   { printf "        %s\n"              "$1"; }
+die()     { err "$1"; exit 1; }
+section() { printf "\n${BOLD}  ── %s${NC}\n"   "$1"; }
 
 header() {
     local title=" $1 " w=60
@@ -74,11 +69,7 @@ header() {
     printf "%s${NC}\n\n" "$line"
 }
 
-section() { printf "\n${BOLD}  ── %s${NC}\n" "$1"; }
-
-# =============================================================================
-# Core helpers
-# =============================================================================
+# ── run() ─────────────────────────────────────────────────────────────────────
 run() {
     if [[ "$DRY_RUN" == "true" ]]; then
         printf "    ${DIM}[dry-run]${NC} %s\n" "$*"
@@ -112,10 +103,9 @@ ask_secret() {
     printf '%s' "$val"
 }
 
-# =============================================================================
-# Pre-flight checks
+# ── Pre-flight ────────────────────────────────────────────────────────────────
 # Sets globals: OS_ID  OS_CODENAME  OS_VERSION_ID  OS_MAJOR
-# =============================================================================
+OS_ID=''; OS_CODENAME=''; OS_VERSION_ID=''; OS_MAJOR=0
 preflight_checks() {
     [[ $EUID -eq 0 || "$DRY_RUN" == "true" ]] \
         || die "Root privileges required. Run as: sudo $0"
@@ -138,9 +128,7 @@ preflight_checks() {
     esac
 }
 
-# =============================================================================
-# User state queries
-# =============================================================================
+# ── User state queries ────────────────────────────────────────────────────────
 is_sudo_member()   { getent group sudo   2>/dev/null | grep -qw "$1"; }
 is_docker_member() { getent group docker 2>/dev/null | grep -qw "$1"; }
 
@@ -219,6 +207,7 @@ list_human_users() {
     done <<< "$users"
 }
 
+# ── Pick / prompt helpers ─────────────────────────────────────────────────────
 pick_human_user() {
     local prompt="$1" exclude="${2:-}" u users=()
     while IFS= read -r u; do
@@ -311,25 +300,7 @@ _apply_password() {
     fi
 }
 
-# =============================================================================
-# Pre-flight
-# =============================================================================
-preflight_checks
-
-# =============================================================================
-# Banner
-# =============================================================================
-printf '\n'
-printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"
-printf "${BLUE}${BOLD}  │                 harden-users.sh                     │${NC}\n"
-printf "${BLUE}${BOLD}  └─────────────────────────────────────────────────────┘${NC}\n"
-printf "  Host:     ${BOLD}%s${NC}\n"            "$(hostname)"
-printf "  OS:       ${BOLD}%s %s (%s)${NC}\n"   "$OS_ID" "$OS_CODENAME" "$OS_VERSION_ID"
-printf "  Dry-run:  ${BOLD}%s${NC}\n\n"         "$DRY_RUN"
-
-# =============================================================================
-# State display
-# =============================================================================
+# ── State display ─────────────────────────────────────────────────────────────
 show_harden_state() {
     compute_user_counts
 
@@ -363,9 +334,7 @@ show_harden_state() {
     printf '\n'
 }
 
-# =============================================================================
-# Check 1 — Ensure at least one non-root sudo user exists
-# =============================================================================
+# ── Check 1 — Ensure at least one non-root sudo user exists ──────────────────
 check_sudo_users() {
     compute_user_counts
 
@@ -478,9 +447,7 @@ _create_sudo_user() {
     return 0
 }
 
-# =============================================================================
-# Check 2 — Ensure root password is locked
-# =============================================================================
+# ── Check 2 — Ensure root password is locked ─────────────────────────────────
 check_root_locked() {
     if ! is_root_pw_enabled; then
         ok "Root password is locked."
@@ -504,47 +471,57 @@ check_root_locked() {
     fi
 }
 
-# =============================================================================
-# Main
-# =============================================================================
-CHECKS_PASSED=()
-CHECKS_FIXED=()
-CHECKS_DECLINED=()
+# ── Main ──────────────────────────────────────────────────────────────────────
+main() {
+    preflight_checks
 
-compute_user_counts
-if (( SUDO_COUNT > 0 )) && ! is_root_pw_enabled; then
+    printf '\n'
+    printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"
+    printf "${BLUE}${BOLD}  │                   harden-users.sh                   │${NC}\n"
+    printf "${BLUE}${BOLD}  └─────────────────────────────────────────────────────┘${NC}\n"
+    printf "  Host:     ${BOLD}%s${NC}\n"            "$(hostname)"
+    printf "  OS:       ${BOLD}%s %s (%s)${NC}\n"   "$OS_ID" "$OS_CODENAME" "$OS_VERSION_ID"
+    printf "  Dry-run:  ${BOLD}%s${NC}\n\n"         "$DRY_RUN"
+
+    CHECKS_PASSED=()
+    CHECKS_FIXED=()
+    CHECKS_DECLINED=()
+
+    compute_user_counts
+    if (( SUDO_COUNT > 0 )) && ! is_root_pw_enabled; then
+        show_harden_state
+        ok "All hardening checks pass. No action needed."
+        exit 0
+    fi
+
+    section "Check 1 — Non-Root Sudo User"
+    check_sudo_users
+
+    section "Check 2 — Root Password"
+    check_root_locked
+
+    # ── Final state + summary ─────────────────────────────────────────────────
+    header "Hardening State"
     show_harden_state
-    ok "All hardening checks pass. No action needed."
-    exit 0
-fi
 
-section "Check 1 — Non-Root Sudo User"
-check_sudo_users
+    printf "  ${BOLD}Summary${NC}\n\n"
 
-section "Check 2 — Root Password"
-check_root_locked
+    for msg in "${CHECKS_PASSED[@]+"${CHECKS_PASSED[@]}"}"; do
+        printf "  ${GREEN}  ✓${NC}  %s\n" "$msg"
+    done
+    for msg in "${CHECKS_FIXED[@]+"${CHECKS_FIXED[@]}"}"; do
+        printf "  ${CYAN}  ~${NC}  %s\n" "$msg"
+    done
+    for msg in "${CHECKS_DECLINED[@]+"${CHECKS_DECLINED[@]}"}"; do
+        printf "  ${YELLOW}  !${NC}  %s\n" "$msg"
+    done
 
-# =============================================================================
-# Final state + summary
-# =============================================================================
-header "Hardening State"
-show_harden_state
+    printf '\n'
+    if   (( ${#CHECKS_DECLINED[@]} > 0 )); then
+        warn "Some checks were skipped. Re-run $(basename "$0") to address them."
+    elif (( ${#CHECKS_FIXED[@]}   > 0 )); then
+        ok   "All accepted fixes applied. Re-run $(basename "$0") to confirm."
+    fi
+}
 
-printf "  ${BOLD}Summary${NC}\n\n"
-
-for msg in "${CHECKS_PASSED[@]+"${CHECKS_PASSED[@]}"}"; do
-    printf "  ${GREEN}  ✓${NC}  %s\n" "$msg"
-done
-for msg in "${CHECKS_FIXED[@]+"${CHECKS_FIXED[@]}"}"; do
-    printf "  ${CYAN}  ~${NC}  %s\n" "$msg"
-done
-for msg in "${CHECKS_DECLINED[@]+"${CHECKS_DECLINED[@]}"}"; do
-    printf "  ${YELLOW}  !${NC}  %s\n" "$msg"
-done
-
-printf '\n'
-if (( ${#CHECKS_DECLINED[@]} > 0 )); then
-    warn "Some checks were skipped. Re-run harden-users.sh to address them."
-elif (( ${#CHECKS_FIXED[@]} > 0 )); then
-    ok "All issues resolved. Re-run harden-users.sh to confirm."
-fi
+main
