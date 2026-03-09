@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# =============================================================================
+# ==============================================================================
 # manage-users.sh — User account management for Debian/Ubuntu systems
-# =============================================================================
+# ==============================================================================
 # Intended for fresh Proxmox LXC containers (Ubuntu 24.04 template).
 # Compatible with Debian 11+ and Ubuntu 22.04+.
 #
@@ -24,12 +24,10 @@
 #   9)  Grant / revoke Docker access  (only shown when docker group exists)
 #   10) Set / lock root password
 #   11) Exit
-# =============================================================================
+# ==============================================================================
 set -euo pipefail
 
-# =============================================================================
-# Argument parsing
-# =============================================================================
+# ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-false}"
 
 for _arg in "$@"; do
@@ -48,9 +46,7 @@ for _arg in "$@"; do
 done
 unset _arg
 
-# =============================================================================
-# Colors
-# =============================================================================
+# ── Colors ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
     RED=$'\e[0;31m';  GREEN=$'\e[0;32m';  YELLOW=$'\e[1;33m'
     BLUE=$'\e[0;34m'; CYAN=$'\e[0;36m';   BOLD=$'\e[1m'
@@ -59,9 +55,7 @@ else
     RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; NC=''
 fi
 
-# =============================================================================
-# Output helpers
-# =============================================================================
+# ── Output helpers ────────────────────────────────────────────────────────────
 info()    { printf "${CYAN}  >>>  ${NC}%s\n"   "$1"; }
 ok()      { printf "${GREEN}  [+]  ${NC}%s\n"  "$1"; }
 warn()    { printf "${YELLOW}  [!]  ${NC}%s\n" "$1"; }
@@ -79,9 +73,7 @@ header() {
     printf "%s${NC}\n\n" "$line"
 }
 
-# =============================================================================
-# Core helpers
-# =============================================================================
+# ── run() ─────────────────────────────────────────────────────────────────────
 run() {
     if [[ "$DRY_RUN" == "true" ]]; then
         printf "    ${DIM}[dry-run]${NC} %s\n" "$*"
@@ -115,10 +107,14 @@ ask_secret() {
     printf '%s' "$val"
 }
 
-# =============================================================================
-# Pre-flight checks
+# ── Pre-flight ────────────────────────────────────────────────────────────────
 # Sets globals: OS_ID  OS_CODENAME  OS_VERSION_ID  OS_MAJOR
-# =============================================================================
+OS_ID=''; OS_CODENAME=''; OS_VERSION_ID=''; OS_MAJOR=0
+
+# The human who invoked sudo (or empty if running directly as root).
+# Set in main() before any action runs; used by action functions to detect
+# and warn/block self-targeting operations.
+CURRENT_OPERATOR=''
 preflight_checks() {
     [[ $EUID -eq 0 || "$DRY_RUN" == "true" ]] \
         || die "Root privileges required. Run as: sudo $0"
@@ -141,9 +137,7 @@ preflight_checks() {
     esac
 }
 
-# =============================================================================
-# User state queries
-# =============================================================================
+# ── User state queries ────────────────────────────────────────────────────────
 is_sudo_member()   { getent group sudo   2>/dev/null | grep -qw "$1"; }
 is_docker_member() { getent group docker 2>/dev/null | grep -qw "$1"; }
 
@@ -239,6 +233,7 @@ list_human_users() {
     done <<< "$users"
 }
 
+# ── Pick / prompt helpers ─────────────────────────────────────────────────────
 # Result globals — set by the pick/prompt helpers below.
 # Callers read these instead of using $() command substitution, which would
 # capture all display output (warn/info/list_human_users) along with the value.
@@ -357,22 +352,7 @@ _apply_password() {
     fi
 }
 
-# =============================================================================
-# Pre-flight + Banner
-# =============================================================================
-preflight_checks
-
-printf '\n'
-printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"
-printf "${BLUE}${BOLD}  │                 manage-users.sh                     │${NC}\n"
-printf "${BLUE}${BOLD}  └─────────────────────────────────────────────────────┘${NC}\n"
-printf "  Host:     ${BOLD}%s${NC}\n"            "$(hostname)"
-printf "  OS:       ${BOLD}%s %s (%s)${NC}\n"   "$OS_ID" "$OS_CODENAME" "$OS_VERSION_ID"
-printf "  Dry-run:  ${BOLD}%s${NC}\n\n"         "$DRY_RUN"
-
-# =============================================================================
-# Action: Create
-# =============================================================================
+# ── Action: Create user ───────────────────────────────────────────────────────
 action_create() {
     section "Create User"
 
@@ -420,9 +400,7 @@ action_create() {
         || plain "  ssh ${new_user}@<host-ip>"
 }
 
-# =============================================================================
-# Action: Delete
-# =============================================================================
+# ── Action: Delete ───────────────────────────────────────────────────────
 action_delete() {
     section "Delete User"
 
@@ -502,10 +480,8 @@ action_delete() {
     fi
 }
 
-# =============================================================================
-# Action: Disable (lock password + optionally revoke SSH key auth)
+# ── Action: Disable user ──────────────────────────────────────────────────────
 # Blocks password logins; SSH key auth still works unless also revoked.
-# =============================================================================
 action_disable() {
     section "Disable User"
 
@@ -585,9 +561,7 @@ action_disable() {
     fi
 }
 
-# =============================================================================
-# Action: Re-enable (unlock password + optionally restore SSH key auth)
-# =============================================================================
+# ── Action: Re-enable (unlock password + optionally restore SSH key auth) ──
 action_enable() {
     section "Re-enable User"
 
@@ -619,9 +593,7 @@ action_enable() {
     fi
 }
 
-# =============================================================================
-# Action: Change password
-# =============================================================================
+# ── Action: Change password ──────────────────────────────────────────────
 action_change_password() {
     section "Change Password"
 
@@ -635,12 +607,10 @@ action_change_password() {
     ok "Password updated for '${target}'."
 }
 
-# =============================================================================
-# Action: Rename user
+# ── Action: Rename user ───────────────────────────────────────────────────────
 # Changes the login name, renames the home directory, and renames the
 # primary group if it matches the old username (the Debian/Ubuntu default).
 # The user must not be logged in when this runs.
-# =============================================================================
 action_rename() {
     section "Rename User"
 
@@ -708,9 +678,7 @@ action_rename() {
     [[ -d "$new_home" ]] && plain "Home directory moved to ${new_home}."
 }
 
-# =============================================================================
-# Action: Change shell
-# =============================================================================
+# ── Action: Change shell ─────────────────────────────────────────────────
 action_change_shell() {
     section "Change Login Shell"
     plain "Sets the default command interpreter that starts when this user logs in."
@@ -774,9 +742,7 @@ action_change_shell() {
     plain "Open a new session as '${target}' to start using ${new_shell##*/}."
 }
 
-# =============================================================================
-# Action: Toggle sudo membership
-# =============================================================================
+# ── Action: Toggle sudo membership ───────────────────────────────────────
 action_toggle_sudo() {
     section "Grant / Revoke Sudo Access"
 
@@ -818,9 +784,7 @@ action_toggle_sudo() {
     fi
 }
 
-# =============================================================================
-# Action: Toggle Docker group membership
-# =============================================================================
+# ── Action: Toggle Docker group membership ───────────────────────────────
 action_toggle_docker() {
     section "Docker Membership"
 
@@ -856,9 +820,7 @@ action_toggle_docker() {
     fi
 }
 
-# =============================================================================
-# Action: Manage root password
-# =============================================================================
+# ── Action: Manage root password ─────────────────────────────────────────
 action_manage_root() {
     section "Set / Lock Root Password"
 
@@ -898,24 +860,7 @@ action_manage_root() {
     fi
 }
 
-# =============================================================================
-# Main
-# =============================================================================
-
-# The human who invoked sudo (or empty if running directly as root).
-# Used by actions to detect and warn/block self-targeting operations.
-CURRENT_OPERATOR="${SUDO_USER:-}"
-
-# Initial user table
-if [[ -n "${SUDO_USER:-}" ]]; then
-    info "Running as root via sudo (operator: ${SUDO_USER})."
-else
-    warn "Running directly as root (no sudo context detected)."
-fi
-
-printf '\n'
-list_human_users
-compute_user_counts
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 # _show_menu — dynamic: Docker option only shown when group exists
 _show_menu() {
@@ -958,50 +903,78 @@ _menu_default() {
 }
 
 _MENU_MAX=10
-while true; do
-    _show_menu
 
-    MENU_DEFAULT=$(_menu_default)
-    choice=""
-    if [[ -n "$MENU_DEFAULT" ]]; then
-        read -rp $'\n'"    ${YELLOW}>  ${NC}Choice [1-${_MENU_MAX}, default ${MENU_DEFAULT}]: " choice || true
-        choice="${choice:-$MENU_DEFAULT}"
-    else
-        read -rp $'\n'"    ${YELLOW}>  ${NC}Choice [1-${_MENU_MAX}]: " choice || true
-    fi
+main() {
+    preflight_checks
 
-    if getent group docker &>/dev/null; then
-        case "$choice" in
-            1)  action_create          ;;
-            2)  action_delete          ;;
-            3)  action_disable         ;;
-            4)  action_enable          ;;
-            5)  action_change_password ;;
-            6)  action_rename          ;;
-            7)  action_change_shell    ;;
-            8)  action_toggle_sudo     ;;
-            9)  action_toggle_docker   ;;
-            10) action_manage_root     ;;
-            11) info "Exiting."; break ;;
-            *)  warn "Please enter 1–11." ;;
-        esac
+    printf '\n'
+    printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"
+    printf "${BLUE}${BOLD}  │                   manage-users.sh                   │${NC}\n"
+    printf "${BLUE}${BOLD}  └─────────────────────────────────────────────────────┘${NC}\n"
+    printf "  Host:     ${BOLD}%s${NC}\n"            "$(hostname)"
+    printf "  OS:       ${BOLD}%s %s (%s)${NC}\n"   "$OS_ID" "$OS_CODENAME" "$OS_VERSION_ID"
+    printf "  Dry-run:  ${BOLD}%s${NC}\n\n"         "$DRY_RUN"
+
+    # The human who invoked sudo (or empty if running directly as root).
+    CURRENT_OPERATOR="${SUDO_USER:-}"
+
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        info "Running as root via sudo (operator: ${SUDO_USER})."
     else
-        case "$choice" in
-            1)  action_create          ;;
-            2)  action_delete          ;;
-            3)  action_disable         ;;
-            4)  action_enable          ;;
-            5)  action_change_password ;;
-            6)  action_rename          ;;
-            7)  action_change_shell    ;;
-            8)  action_toggle_sudo     ;;
-            9)  action_manage_root     ;;
-            10) info "Exiting."; break ;;
-            *)  warn "Please enter 1–10." ;;
-        esac
+        warn "Running directly as root (no sudo context detected)."
     fi
 
     printf '\n'
     list_human_users
     compute_user_counts
-done
+
+    while true; do
+        _show_menu
+
+        MENU_DEFAULT=$(_menu_default)
+        local choice=""
+        if [[ -n "$MENU_DEFAULT" ]]; then
+            read -rp $'\n'"    ${YELLOW}>  ${NC}Choice [1-${_MENU_MAX}, default ${MENU_DEFAULT}]: " choice || true
+            choice="${choice:-$MENU_DEFAULT}"
+        else
+            read -rp $'\n'"    ${YELLOW}>  ${NC}Choice [1-${_MENU_MAX}]: " choice || true
+        fi
+
+        if getent group docker &>/dev/null; then
+            case "$choice" in
+                1)  action_create          ;;
+                2)  action_delete          ;;
+                3)  action_disable         ;;
+                4)  action_enable          ;;
+                5)  action_change_password ;;
+                6)  action_rename          ;;
+                7)  action_change_shell    ;;
+                8)  action_toggle_sudo     ;;
+                9)  action_toggle_docker   ;;
+                10) action_manage_root     ;;
+                11) info "Exiting."; break ;;
+                *)  warn "Please enter 1–11." ;;
+            esac
+        else
+            case "$choice" in
+                1)  action_create          ;;
+                2)  action_delete          ;;
+                3)  action_disable         ;;
+                4)  action_enable          ;;
+                5)  action_change_password ;;
+                6)  action_rename          ;;
+                7)  action_change_shell    ;;
+                8)  action_toggle_sudo     ;;
+                9)  action_manage_root     ;;
+                10) info "Exiting."; break ;;
+                *)  warn "Please enter 1–10." ;;
+            esac
+        fi
+
+        printf '\n'
+        list_human_users
+        compute_user_counts
+    done
+}
+
+main
