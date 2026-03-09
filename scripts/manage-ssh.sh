@@ -230,7 +230,8 @@ load_state() {
 count_keys() {
     local f="$1"
     [[ -f "$f" ]] || { printf '0'; return; }
-    grep -c "^ssh-\|^ecdsa-\|^sk-" "$f" 2>/dev/null || printf '0'
+    local n; n=$(grep -cE "^(ssh-|ecdsa-|sk-)" "$f" 2>/dev/null) || n=0
+    printf '%s' "$n"
 }
 
 # ── show_key_help ─────────────────────────────────────────────────────────────
@@ -814,14 +815,15 @@ _conf_color() {
 }
 
 # ── _show_full_config_table ───────────────────────────────────────────────────
-# Prints a numbered, colour-coded table of all manageable SSH directives.
+# Prints a numbered, colour-coded table of all manageable SSH directives,
+# using plain-English labels from _directive_label().
 _show_full_config_table() {
     local dn dk dv
     printf -v dn '%*s' 4  ''; dn="${dn// /─}"
-    printf -v dk '%*s' 32 ''; dk="${dk// /─}"
+    printf -v dk '%*s' 36 ''; dk="${dk// /─}"
     printf -v dv '%*s' 20 ''; dv="${dv// /─}"
     printf '\n'
-    printf "    ${BOLD}%-4s %-32s %s${NC}\n" "#" "Setting" "Effective value"
+    printf "    ${BOLD}%-4s %-36s %s${NC}\n" "#" "Setting" "Effective value"
     printf "    %s %s %s\n" "$dn" "$dk" "$dv"
 
     local -a _dirs _vals
@@ -844,13 +846,14 @@ _show_full_config_table() {
 
     local _i
     for _i in "${!_dirs[@]}"; do
-        local _d="${_dirs[$_i]}" _v="${_vals[$_i]}" _c
+        local _d="${_dirs[$_i]}" _v="${_vals[$_i]}" _c _lbl
+        _lbl=$(_directive_label "$_d")
         if [[ "$_d" == "Algorithms (modern set)" ]]; then
             [[ "$CONF_SET_ALGORITHMS" == "true" ]] && _c="$GREEN" || _c="$YELLOW"
         else
             _c=$(_conf_color "$_d" "$_v")
         fi
-        printf "    ${CYAN}%-4s${NC} ${_c}%-32s %s${NC}\n" "$((_i+1)))" "$_d" "$_v"
+        printf "    ${CYAN}%-4s${NC} ${_c}%-36s %s${NC}\n" "$((_i+1)))" "$_lbl" "$_v"
     done
     printf '\n'
 }
@@ -904,8 +907,9 @@ _print_directive_desc() {
 # ── _print_directive_help <directive> ────────────────────────────────────────
 # Prints detailed help text for a directive (shown when user enters 'h').
 _print_directive_help() {
+    local _lbl; _lbl=$(_directive_label "$1")
     printf '\n'
-    section "Help: $1"
+    section "Help: ${_lbl}"
     printf '\n'
     case "$1" in
         Port)
@@ -1292,6 +1296,27 @@ DROPIN
     fi
 }
 
+# ── _directive_label <directive> ─────────────────────────────────────────────
+# Returns a plain-English label for display in the config table.
+_directive_label() {
+    case "$1" in
+        Port)                         printf 'SSH port' ;;
+        PubkeyAuthentication)         printf 'Allow SSH key login' ;;
+        PasswordAuthentication)       printf 'Allow password login' ;;
+        KbdInteractiveAuthentication) printf 'Allow PAM/challenge login' ;;
+        PermitRootLogin)              printf 'Allow root login' ;;
+        PermitEmptyPasswords)         printf 'Allow blank passwords' ;;
+        MaxAuthTries)                 printf 'Max login attempts' ;;
+        LoginGraceTime)               printf 'Login timeout (seconds)' ;;
+        ClientAliveInterval)          printf 'Idle check interval (seconds)' ;;
+        ClientAliveCountMax)          printf 'Idle checks before disconnect' ;;
+        X11Forwarding)                printf 'Allow graphical (X11) forwarding' ;;
+        AllowTcpForwarding)           printf 'Allow TCP tunnel forwarding' ;;
+        "Algorithms (modern set)")    printf 'Restrict to modern algorithms' ;;
+        *)                            printf '%s' "$1" ;;
+    esac
+}
+
 # ── Action: edit SSH configuration ────────────────────────────────────────────
 action_edit_config() {
     section "Edit SSH Configuration"
@@ -1321,102 +1346,111 @@ action_edit_config() {
         "Algorithms (modern set)"
     )
 
-    _show_full_config_table
-
-    local choice
+    # ── Config edit loop — stay in this menu until the user blanks out ────────
     while true; do
-        choice=$(ask_val "Setting number to edit (blank to cancel)" "")
-        [[ -z "$choice" ]] && { info "Cancelled."; return 0; }
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#_edit_dirs[@]} )); then
-            break
-        fi
-        warn "Enter a number between 1 and ${#_edit_dirs[@]}, or blank to cancel."
-    done
+        load_config_state
+        _show_full_config_table
 
-    local idx=$(( choice - 1 ))
-    local directive="${_edit_dirs[$idx]}"
+        local choice
+        while true; do
+            choice=$(ask_val "Setting number to edit (blank to return to main menu)" "")
+            [[ -z "$choice" ]] && { info "Returning to main menu."; return 0; }
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#_edit_dirs[@]} )); then
+                break
+            fi
+            warn "Enter a number between 1 and ${#_edit_dirs[@]}, or blank to return."
+        done
 
-    # Resolve current value from CONF_*
-    local current
-    case "$directive" in
-        "Port")                         current="$CONF_PORT" ;;
-        "PubkeyAuthentication")         current="$CONF_PUBKEY_AUTH" ;;
-        "PasswordAuthentication")       current="$CONF_PASSWORD_AUTH" ;;
-        "KbdInteractiveAuthentication") current="$CONF_KBD_AUTH" ;;
-        "PermitRootLogin")              current="$CONF_PERMIT_ROOT_LOGIN" ;;
-        "PermitEmptyPasswords")         current="$CONF_EMPTY_PASSWORDS" ;;
-        "MaxAuthTries")                 current="$CONF_MAX_AUTH_TRIES" ;;
-        "LoginGraceTime")               current="$CONF_LOGIN_GRACE_TIME" ;;
-        "ClientAliveInterval")          current="$CONF_ALIVE_INTERVAL" ;;
-        "ClientAliveCountMax")          current="$CONF_ALIVE_COUNT" ;;
-        "X11Forwarding")                current="$CONF_X11_FORWARDING" ;;
-        "AllowTcpForwarding")           current="$CONF_TCP_FORWARDING" ;;
-        "Algorithms (modern set)")
-            [[ "$CONF_SET_ALGORITHMS" == "true" ]] && current="yes" || current="no" ;;
-    esac
+        local idx=$(( choice - 1 ))
+        local directive="${_edit_dirs[$idx]}"
+        local label; label=$(_directive_label "$directive")
 
-    printf '\n'
-    printf "    ${BOLD}%s${NC}  (current: ${CYAN}%s${NC})\n" "$directive" "$current"
-    printf '\n'
-    _print_directive_desc "$directive"
-    printf '\n'
+        # Resolve current value from CONF_*
+        local current
+        case "$directive" in
+            "Port")                         current="$CONF_PORT" ;;
+            "PubkeyAuthentication")         current="$CONF_PUBKEY_AUTH" ;;
+            "PasswordAuthentication")       current="$CONF_PASSWORD_AUTH" ;;
+            "KbdInteractiveAuthentication") current="$CONF_KBD_AUTH" ;;
+            "PermitRootLogin")              current="$CONF_PERMIT_ROOT_LOGIN" ;;
+            "PermitEmptyPasswords")         current="$CONF_EMPTY_PASSWORDS" ;;
+            "MaxAuthTries")                 current="$CONF_MAX_AUTH_TRIES" ;;
+            "LoginGraceTime")               current="$CONF_LOGIN_GRACE_TIME" ;;
+            "ClientAliveInterval")          current="$CONF_ALIVE_INTERVAL" ;;
+            "ClientAliveCountMax")          current="$CONF_ALIVE_COUNT" ;;
+            "X11Forwarding")                current="$CONF_X11_FORWARDING" ;;
+            "AllowTcpForwarding")           current="$CONF_TCP_FORWARDING" ;;
+            "Algorithms (modern set)")
+                [[ "$CONF_SET_ALGORITHMS" == "true" ]] && current="yes" || current="no" ;;
+        esac
 
-    # Prompt for new value; 'h' shows full help, blank cancels
-    local new_val
-    while true; do
-        new_val=$(ask_val "New value (h for detailed help, blank to cancel)" "")
-        [[ -z "$new_val" ]] && { info "Cancelled — no changes made."; return 0; }
-        if [[ "${new_val,,}" == "h" ]]; then
-            _print_directive_help "$directive"
+        printf '\n'
+        printf "    ${BOLD}%s${NC}  ${DIM}(%s)${NC}  (current: ${CYAN}%s${NC})\n" \
+            "$label" "$directive" "$current"
+        printf '\n'
+        _print_directive_desc "$directive"
+        printf '\n'
+
+        # Prompt for new value; 'h' shows full help, blank cancels this setting
+        local new_val
+        while true; do
+            new_val=$(ask_val "New value (h for detailed help, blank to skip)" "")
+            [[ -z "$new_val" ]] && { info "Skipped — no changes made."; break; }
+            if [[ "${new_val,,}" == "h" ]]; then
+                _print_directive_help "$directive"
+                continue
+            fi
+            _validate_directive "$directive" "$new_val" && break
+            # _validate_directive already printed the warning; loop back
+        done
+
+        [[ -z "$new_val" ]] && continue
+
+        # Normalise case for keyword values
+        case "${new_val,,}" in
+            yes|no|local|remote|all|prohibit-password|forced-commands-only)
+                new_val="${new_val,,}" ;;
+        esac
+
+        # No-op check
+        if [[ "${new_val,,}" == "${current,,}" ]]; then
+            ok "${label} is already '${new_val}' — nothing to change."
             continue
         fi
-        _validate_directive "$directive" "$new_val" && break
-        # _validate_directive already printed the warning; loop back
+
+        # Recommendation check — warn and require explicit confirmation to proceed
+        if ! _is_recommended "$directive" "$new_val"; then
+            printf '\n'
+            warn "'${new_val}' is outside the recommended setting for: ${label}."
+            _print_recommendation_warning "$directive" "$new_val"
+            printf '\n'
+            ask "Proceed with this value anyway?" "n" \
+                || { info "Cancelled — no changes made."; continue; }
+        fi
+
+        # Apply: update CONF_* then write the drop-in
+        case "$directive" in
+            "Port")                         CONF_PORT="$new_val" ;;
+            "PubkeyAuthentication")         CONF_PUBKEY_AUTH="$new_val" ;;
+            "PasswordAuthentication")       CONF_PASSWORD_AUTH="$new_val" ;;
+            "KbdInteractiveAuthentication") CONF_KBD_AUTH="$new_val" ;;
+            "PermitRootLogin")              CONF_PERMIT_ROOT_LOGIN="$new_val" ;;
+            "PermitEmptyPasswords")         CONF_EMPTY_PASSWORDS="$new_val" ;;
+            "MaxAuthTries")                 CONF_MAX_AUTH_TRIES="$new_val" ;;
+            "LoginGraceTime")               CONF_LOGIN_GRACE_TIME="$new_val" ;;
+            "ClientAliveInterval")          CONF_ALIVE_INTERVAL="$new_val" ;;
+            "ClientAliveCountMax")          CONF_ALIVE_COUNT="$new_val" ;;
+            "X11Forwarding")               CONF_X11_FORWARDING="$new_val" ;;
+            "AllowTcpForwarding")           CONF_TCP_FORWARDING="$new_val" ;;
+            "Algorithms (modern set)")
+                [[ "$new_val" == "yes" ]] && CONF_SET_ALGORITHMS=true || CONF_SET_ALGORITHMS=false ;;
+        esac
+
+        if write_config_dropin; then
+            ok "${label} changed to '${new_val}'"
+        fi
+        printf '\n'
     done
-
-    # Normalise case for keyword values
-    case "${new_val,,}" in
-        yes|no|local|remote|all|prohibit-password|forced-commands-only)
-            new_val="${new_val,,}" ;;
-    esac
-
-    # No-op check
-    if [[ "${new_val,,}" == "${current,,}" ]]; then
-        ok "${directive} is already '${new_val}' — nothing to change."
-        return 0
-    fi
-
-    # Recommendation check — warn and require explicit confirmation to proceed
-    if ! _is_recommended "$directive" "$new_val"; then
-        printf '\n'
-        warn "'${new_val}' is outside the recommended configuration for ${directive}."
-        _print_recommendation_warning "$directive" "$new_val"
-        printf '\n'
-        ask "Proceed with this value anyway?" "n" \
-            || { info "Cancelled — no changes made."; return 0; }
-    fi
-
-    # Apply: update CONF_* then write the drop-in
-    case "$directive" in
-        "Port")                         CONF_PORT="$new_val" ;;
-        "PubkeyAuthentication")         CONF_PUBKEY_AUTH="$new_val" ;;
-        "PasswordAuthentication")       CONF_PASSWORD_AUTH="$new_val" ;;
-        "KbdInteractiveAuthentication") CONF_KBD_AUTH="$new_val" ;;
-        "PermitRootLogin")              CONF_PERMIT_ROOT_LOGIN="$new_val" ;;
-        "PermitEmptyPasswords")         CONF_EMPTY_PASSWORDS="$new_val" ;;
-        "MaxAuthTries")                 CONF_MAX_AUTH_TRIES="$new_val" ;;
-        "LoginGraceTime")               CONF_LOGIN_GRACE_TIME="$new_val" ;;
-        "ClientAliveInterval")          CONF_ALIVE_INTERVAL="$new_val" ;;
-        "ClientAliveCountMax")          CONF_ALIVE_COUNT="$new_val" ;;
-        "X11Forwarding")                CONF_X11_FORWARDING="$new_val" ;;
-        "AllowTcpForwarding")           CONF_TCP_FORWARDING="$new_val" ;;
-        "Algorithms (modern set)")
-            [[ "$new_val" == "yes" ]] && CONF_SET_ALGORITHMS=true || CONF_SET_ALGORITHMS=false ;;
-    esac
-
-    if write_config_dropin; then
-        ok "${directive} changed to '${new_val}'"
-    fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
