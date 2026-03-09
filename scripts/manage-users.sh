@@ -22,7 +22,7 @@
 #   7)  Change login shell (e.g. bash → zsh, fish)
 #   8)  Grant / revoke sudo access
 #   9)  Grant / revoke Docker access  (only shown when docker group exists)
-#   10) Manage root password
+#   10) Set / lock root password
 #   11) Exit
 # =============================================================================
 set -euo pipefail
@@ -163,6 +163,23 @@ get_user_status() {
     esac
 }
 
+# would_lose_all_admin TARGET
+# Returns 0 (true) if removing admin rights from TARGET would leave NO privileged
+# path into the system: root password is locked AND no other sudo users exist.
+# Used to hard-block actions that would permanently lock the operator out.
+would_lose_all_admin() {
+    local target="$1"
+    is_sudo_member "$target" || return 1  # target has no sudo — action can't remove admin access
+    is_root_pw_enabled && return 1        # root pw active → root can still fix things
+    local u other_sudo=0
+    while IFS= read -r u; do
+        [[ "$u" == "$target" ]] && continue
+        is_sudo_member "$u" && (( other_sudo++ )) || true
+    done < <(getent passwd 2>/dev/null \
+        | awk -F: '$3 >= 1000 && $3 < 65534 { print $1 }' || true)
+    (( other_sudo == 0 ))
+}
+
 compute_user_counts() {
     HUMAN_COUNT=$(getent passwd 2>/dev/null \
         | awk -F: '$3 >= 1000 && $3 < 65534 { print $1 }' \
@@ -222,13 +239,21 @@ list_human_users() {
     done <<< "$users"
 }
 
-# pick_human_user PROMPT [EXCLUDE_USER]
-# Shows the user table, prompts for a valid username, retries on bad input.
-# Prints chosen username to stdout; returns 1 if no eligible users exist.
+# Result globals — set by the pick/prompt helpers below.
+# Callers read these instead of using $() command substitution, which would
+# capture all display output (warn/info/list_human_users) along with the value.
+_PICK_RESULT=''
+_USERNAME_RESULT=''
+_PASSWORD_RESULT=''
+
+# pick_human_user PROMPT
+# Displays the user table, prompts for a valid username, retries on bad input.
+# Sets _PICK_RESULT; returns 1 (and prints "Cancelled.") on blank input or if
+# no eligible users exist.  Never call with $() — use the global instead.
 pick_human_user() {
-    local prompt="$1" exclude="${2:-}" u users=()
+    local prompt="$1" u users=()
+    _PICK_RESULT=''
     while IFS= read -r u; do
-        [[ "$u" == "$exclude" ]] && continue
         users+=("$u")
     done < <(getent passwd 2>/dev/null \
         | awk -F: '$3 >= 1000 && $3 < 65534 { print $1 }' \
@@ -242,8 +267,9 @@ pick_human_user() {
     printf '\n'
     list_human_users
     printf '\n'
-    printf "    ${DIM}Users: %s${NC}\n" "$(printf '%s  ' "${users[@]}")"
-    printf '\n'
+    printf "    ${DIM}Available users: "
+    printf '%s  ' "${users[@]}"
+    printf "${NC}\n\n"
 
     local chosen found
     while true; do
@@ -257,7 +283,7 @@ pick_human_user() {
             [[ "$u" == "$chosen" ]] && found=true && break
         done
         if [[ "$found" == "true" ]]; then
-            printf '%s' "$chosen"
+            _PICK_RESULT="$chosen"
             return 0
         fi
         warn "User '${chosen}' not found — try again, or Enter to cancel."
@@ -265,6 +291,7 @@ pick_human_user() {
 }
 
 _prompt_new_username() {
+    _USERNAME_RESULT=''
     local candidate
     while true; do
         candidate=$(ask_val "New username (Enter to cancel)")
@@ -281,12 +308,13 @@ _prompt_new_username() {
         if id "$candidate" &>/dev/null; then
             warn "User '${candidate}' already exists."; continue
         fi
-        printf '%s' "$candidate"
+        _USERNAME_RESULT="$candidate"
         return 0
     done
 }
 
 _prompt_password() {
+    _PASSWORD_RESULT=''
     local username="$1" pw1 pw2
     info "Leave both password fields blank to cancel."
     while true; do
@@ -307,7 +335,7 @@ _prompt_password() {
             warn "Password is only ${#pw1} character(s) — 8 or more is recommended."
             ask "Continue with this short password?" "n" || continue
         fi
-        printf '%s' "$pw1"
+        _PASSWORD_RESULT="$pw1"
         return 0
     done
 }
@@ -348,10 +376,11 @@ printf "  Dry-run:  ${BOLD}%s${NC}\n\n"         "$DRY_RUN"
 action_create() {
     section "Create User"
 
-    local new_user new_password
+    _prompt_new_username || return 0
+    local new_user="$_USERNAME_RESULT"
 
-    new_user=$(_prompt_new_username)    || { return 0; }
-    new_password=$(_prompt_password "$new_user") || { return 0; }
+    _prompt_password "$new_user" || return 0
+    local new_password="$_PASSWORD_RESULT"
 
     local _user_ref="$new_user"
     _create_cleanup() {
@@ -397,14 +426,23 @@ action_create() {
 action_delete() {
     section "Delete User"
 
-    local target
-    target=$(pick_human_user "Username to delete") || return 0
+    pick_human_user "Username to delete" || return 0
+    local target="$_PICK_RESULT"
 
-    # Warn if operator is trying to delete themselves
+    # Self-targeting checks
     if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
         printf '\n'
+        if would_lose_all_admin "$target"; then
+            err "Blocked: deleting your own account would lock you out of this system."
+            plain "Root password is locked and you are the only sudo user."
+            plain "To proceed safely, do one of these first:"
+            plain "  • Create another sudo user (option 1)"
+            plain "  • Enable the root password (option 9 or 10)"
+            info "Action cancelled."
+            return 0
+        fi
         warn "You are about to delete your own account ('${target}')."
-        plain "If you proceed you will lose the ability to log back in as this user."
+        plain "You will not be able to log back in as this user."
         ask "Continue anyway?" "n" || { info "Cancelled."; return 0; }
     fi
 
@@ -471,15 +509,36 @@ action_delete() {
 action_disable() {
     section "Disable User"
 
-    local target
-    target=$(pick_human_user "Username to disable") || return 0
+    pick_human_user "Username to disable" || return 0
+    local target="$_PICK_RESULT"
 
-    # Warn if operator is trying to disable themselves
+    # Resolve SSH key status early — needed by both the self-warning and the main flow.
+    local auth_keys="/home/${target}/.ssh/authorized_keys"
+    local keys_active=false
+    [[ -f "$auth_keys" ]] && keys_active=true
+
+    # Self-targeting checks
     if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
         printf '\n'
-        warn "You are about to disable your own account ('${target}')."
-        plain "This will lock your password — you will not be able to log back in"
-        plain "with a password unless another sudo user re-enables this account."
+        if would_lose_all_admin "$target"; then
+            err "Blocked: disabling your own account would lock you out of this system."
+            plain "Root password is locked and you are the only sudo user."
+            plain "Locking your password also breaks sudo — sudo requires your password."
+            plain "To proceed safely, do one of these first:"
+            plain "  • Create another sudo user (option 1)"
+            plain "  • Enable the root password (option 9 or 10)"
+            info "Action cancelled."
+            return 0
+        fi
+        warn "You are about to disable your own currently logged-in account ('${target}')."
+        plain "Locking your password will:"
+        plain "  • Block password-based SSH and console logins"
+        plain "  • Break sudo (sudo requires your password by default)"
+        if [[ "$keys_active" == "true" ]]; then
+            plain "  You have SSH authorized_keys — you can still SSH in, but sudo will fail."
+        else
+            plain "  You have no SSH authorized_keys — you will be completely locked out."
+        fi
         ask "Continue anyway?" "n" || { info "Cancelled."; return 0; }
     fi
 
@@ -487,27 +546,26 @@ action_disable() {
     local status
     status=$(get_user_status "$target")
 
-    local auth_keys="/home/${target}/.ssh/authorized_keys"
-    local keys_active=false
-    [[ -f "$auth_keys" ]] && keys_active=true
-
     if [[ "$status" == "locked" ]]; then
         info "'${target}' is already disabled (password locked)."
-        # Still offer to revoke SSH keys if present and not yet disabled
         if [[ "$keys_active" == "true" ]]; then
-            warn "Note: '${target}' still has an authorized_keys file — SSH key logins remain active."
+            warn "'${target}' still has an authorized_keys file — SSH key logins remain active."
             if ask "Disable SSH key auth now (rename authorized_keys)?" "y"; then
                 run mv "$auth_keys" "${auth_keys}.disabled"
                 ok "SSH authorized_keys renamed to authorized_keys.disabled."
             fi
+        else
+            info "No SSH authorized_keys file found — SSH key logins are already inactive."
         fi
         return 0
     fi
 
-    warn "Locking '${target}' blocks password logins."
+    warn "Locking '${target}' will block password logins and break sudo for this user."
     if [[ "$keys_active" == "true" ]]; then
-        plain "Note: '${target}' has an authorized_keys file — locking the password"
-        plain "alone will not block SSH key logins."
+        plain "They have SSH authorized_keys — SSH key logins will stay active"
+        plain "unless you also revoke the authorized_keys file in the step below."
+    else
+        plain "They have no SSH authorized_keys — all logins will be blocked."
     fi
 
     ask "Disable '${target}'?" "y" || { info "No changes made."; return 0; }
@@ -516,12 +574,14 @@ action_disable() {
     ok "'${target}' disabled (password locked)."
 
     if [[ "$keys_active" == "true" ]]; then
-        if ask "Also disable SSH key auth (rename authorized_keys)?" "y"; then
+        if ask "Also disable SSH key auth for '${target}' (rename authorized_keys)?" "y"; then
             run mv "$auth_keys" "${auth_keys}.disabled"
             ok "SSH authorized_keys renamed to authorized_keys.disabled."
         else
-            warn "'${target}' can still log in via SSH key."
+            warn "'${target}' can still log in via SSH key — password login is blocked only."
         fi
+    else
+        info "No SSH authorized_keys file found — SSH key logins already inactive."
     fi
 }
 
@@ -531,8 +591,8 @@ action_disable() {
 action_enable() {
     section "Re-enable User"
 
-    local target
-    target=$(pick_human_user "Username to re-enable") || return 0
+    pick_human_user "Username to re-enable" || return 0
+    local target="$_PICK_RESULT"
 
     printf '\n'
     local status
@@ -565,13 +625,12 @@ action_enable() {
 action_change_password() {
     section "Change Password"
 
-    local target
-    target=$(pick_human_user "Username") || return 0
+    pick_human_user "Username" || return 0
+    local target="$_PICK_RESULT"
 
     printf '\n'
-    local new_password
-    new_password=$(_prompt_password "$target") || { return 0; }
-    _apply_password "$target" "$new_password"
+    _prompt_password "$target" || return 0
+    _apply_password "$target" "$_PASSWORD_RESULT"
 
     ok "Password updated for '${target}'."
 }
@@ -585,8 +644,8 @@ action_change_password() {
 action_rename() {
     section "Rename User"
 
-    local target
-    target=$(pick_human_user "Username to rename") || return 0
+    pick_human_user "Username to rename" || return 0
+    local target="$_PICK_RESULT"
 
     if who 2>/dev/null | awk '{print $1}' | grep -qx "$target"; then
         printf '\n'
@@ -595,7 +654,7 @@ action_rename() {
         return 0
     fi
 
-    # Warn if operator is trying to rename themselves
+    # Warn if renaming own account
     if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
         printf '\n'
         warn "You are about to rename your own account ('${target}')."
@@ -654,11 +713,12 @@ action_rename() {
 # =============================================================================
 action_change_shell() {
     section "Change Login Shell"
-    plain "Switches the default command interpreter that starts when this user logs in."
-    plain "Common choices: /bin/bash (default), /bin/zsh, /bin/fish, /bin/sh"
+    plain "Sets the default command interpreter that starts when this user logs in."
+    plain "Common choices: /bin/bash (default), /bin/zsh, /bin/fish"
+    plain "The change takes effect the next time the user opens a new session."
 
-    local target
-    target=$(pick_human_user "Username") || return 0
+    pick_human_user "Username" || return 0
+    local target="$_PICK_RESULT"
 
     # Build list from /etc/shells, excluding nologin/false/sync entries
     local shells=()
@@ -711,24 +771,34 @@ action_change_shell() {
 
     run usermod -s "$new_shell" "$target"
     ok "'${target}' login shell set to ${new_shell}."
-    plain "The change takes effect the next time '${target}' opens a new session."
+    plain "Open a new session as '${target}' to start using ${new_shell##*/}."
 }
 
 # =============================================================================
 # Action: Toggle sudo membership
 # =============================================================================
 action_toggle_sudo() {
-    section "Sudo Membership"
+    section "Grant / Revoke Sudo Access"
 
-    local target
-    target=$(pick_human_user "Username to modify") || return 0
+    pick_human_user "Username to modify" || return 0
+    local target="$_PICK_RESULT"
 
     printf '\n'
     if is_sudo_member "$target"; then
-        warn "'${target}' is in the sudo group."
+        warn "'${target}' currently has sudo access."
         if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
-            warn "This is your own account — removing sudo will lock you out of privileged commands."
-            plain "You will not be able to run sudo until another admin re-adds you."
+            if would_lose_all_admin "$target"; then
+                printf '\n'
+                err "Blocked: removing your own sudo access would lock you out of this system."
+                plain "Root password is locked and you are the only sudo user."
+                plain "To proceed safely, do one of these first:"
+                plain "  • Create another sudo user (option 1)"
+                plain "  • Enable the root password (option 9 or 10)"
+                info "Action cancelled."
+                return 0
+            fi
+            warn "This is your own account — removing sudo means you will no longer"
+            plain "be able to run privileged commands until another admin re-adds you."
         fi
         if ask "Remove '${target}' from sudo?" "n"; then
             run gpasswd -d "$target" sudo
@@ -738,9 +808,10 @@ action_toggle_sudo() {
         fi
     else
         warn "'${target}' does not have sudo access."
-        if ask "Add '${target}' to sudo?" "y"; then
+        if ask "Grant '${target}' sudo access?" "y"; then
             run usermod -aG sudo "$target"
             ok "'${target}' added to sudo."
+            plain "They must log out and back in for this to take effect."
         else
             info "No changes made."
         fi
@@ -760,8 +831,8 @@ action_toggle_docker() {
         return 0
     fi
 
-    local target
-    target=$(pick_human_user "Username to modify") || return 0
+    pick_human_user "Username to modify" || return 0
+    local target="$_PICK_RESULT"
 
     printf '\n'
     if is_docker_member "$target"; then
@@ -789,7 +860,7 @@ action_toggle_docker() {
 # Action: Manage root password
 # =============================================================================
 action_manage_root() {
-    section "Root Password"
+    section "Set / Lock Root Password"
 
     printf '\n'
     if is_root_pw_enabled; then
@@ -812,9 +883,8 @@ action_manage_root() {
 
         warn "Setting a root password is not recommended — use 'sudo -i' instead."
         if ask "Set a root password anyway?" "n"; then
-            local new_password
-            new_password=$(_prompt_password "root")
-            _apply_password "root" "$new_password"
+            _prompt_password "root" || return 0
+            _apply_password "root" "$_PASSWORD_RESULT"
             if [[ "$DRY_RUN" == "false" ]]; then
                 passwd -u root 2>/dev/null || true
             else
@@ -832,8 +902,8 @@ action_manage_root() {
 # Main
 # =============================================================================
 
-# The operator is the human who invoked sudo (or root if no sudo context).
-# Used to warn when a destructive action targets the currently logged-in user.
+# The human who invoked sudo (or empty if running directly as root).
+# Used by actions to detect and warn/block self-targeting operations.
 CURRENT_OPERATOR="${SUDO_USER:-}"
 
 # Initial user table
@@ -853,9 +923,11 @@ _show_menu() {
     getent group docker &>/dev/null && docker_exists=true
 
     local root_label
-    is_root_pw_enabled \
-        && root_label="Root password  ${DIM}(active — consider locking)${NC}" \
-        || root_label="Root password  ${DIM}(locked)${NC}"
+    if is_root_pw_enabled; then
+        root_label="Set / lock root password  ${DIM}(active — consider locking)${NC}"
+    else
+        root_label="Set / lock root password  ${DIM}(locked)${NC}"
+    fi
 
     printf "\n  ${BOLD}Actions${NC}\n\n"
     printf "    1)  Create user\n"
@@ -881,7 +953,7 @@ _show_menu() {
 # _menu_default — nudge toward the most useful action based on current state
 _menu_default() {
     (( HUMAN_COUNT == 0 )) && printf '1' && return
-    (( SUDO_COUNT  == 0 )) && printf '8' && return   # nudge toward Grant / revoke sudo access
+    (( SUDO_COUNT  == 0 )) && printf '8' && return
     printf ''
 }
 
