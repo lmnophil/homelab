@@ -19,9 +19,9 @@
 #   4)  Re-enable a user (unlock password + optionally restore SSH key auth)
 #   5)  Change password
 #   6)  Rename user
-#   7)  Change shell
-#   8)  Sudo membership
-#   9)  Docker membership        (only shown when docker group exists)
+#   7)  Change login shell (e.g. bash → zsh, fish)
+#   8)  Grant / revoke sudo access
+#   9)  Grant / revoke Docker access  (only shown when docker group exists)
 #   10) Manage root password
 #   11) Exit
 # =============================================================================
@@ -242,10 +242,16 @@ pick_human_user() {
     printf '\n'
     list_human_users
     printf '\n'
+    printf "    ${DIM}Users: %s${NC}\n" "$(printf '%s  ' "${users[@]}")"
+    printf '\n'
 
     local chosen found
     while true; do
-        chosen=$(ask_val "$prompt")
+        chosen=$(ask_val "${prompt} (Enter to cancel)")
+        if [[ -z "$chosen" ]]; then
+            info "Cancelled."
+            return 1
+        fi
         found=false
         for u in "${users[@]}"; do
             [[ "$u" == "$chosen" ]] && found=true && break
@@ -254,16 +260,17 @@ pick_human_user() {
             printf '%s' "$chosen"
             return 0
         fi
-        warn "User '${chosen}' not found — please try again."
+        warn "User '${chosen}' not found — try again, or Enter to cancel."
     done
 }
 
 _prompt_new_username() {
     local candidate
     while true; do
-        candidate=$(ask_val "New username")
+        candidate=$(ask_val "New username (Enter to cancel)")
         if [[ -z "$candidate" ]]; then
-            warn "Username cannot be blank."; continue
+            info "Cancelled."
+            return 1
         fi
         if ! [[ "$candidate" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
             warn "Invalid username '${candidate}'."
@@ -281,9 +288,14 @@ _prompt_new_username() {
 
 _prompt_password() {
     local username="$1" pw1 pw2
+    info "Leave both password fields blank to cancel."
     while true; do
         pw1=$(ask_secret "Password for ${username}")
         pw2=$(ask_secret "Confirm password")
+        if [[ -z "$pw1" && -z "$pw2" ]]; then
+            info "Cancelled."
+            return 1
+        fi
         if [[ "$pw1" != "$pw2" ]]; then
             warn "Passwords do not match — try again."
             continue
@@ -338,8 +350,8 @@ action_create() {
 
     local new_user new_password
 
-    new_user=$(_prompt_new_username)
-    new_password=$(_prompt_password "$new_user")
+    new_user=$(_prompt_new_username)    || { return 0; }
+    new_password=$(_prompt_password "$new_user") || { return 0; }
 
     local _user_ref="$new_user"
     _create_cleanup() {
@@ -385,9 +397,16 @@ action_create() {
 action_delete() {
     section "Delete User"
 
-    local operator="${SUDO_USER:-}"
     local target
-    target=$(pick_human_user "Username to delete" "$operator") || return 0
+    target=$(pick_human_user "Username to delete") || return 0
+
+    # Warn if operator is trying to delete themselves
+    if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
+        printf '\n'
+        warn "You are about to delete your own account ('${target}')."
+        plain "If you proceed you will lose the ability to log back in as this user."
+        ask "Continue anyway?" "n" || { info "Cancelled."; return 0; }
+    fi
 
     # Check for active login sessions
     if who 2>/dev/null | awk '{print $1}' | grep -qx "$target"; then
@@ -454,6 +473,15 @@ action_disable() {
 
     local target
     target=$(pick_human_user "Username to disable") || return 0
+
+    # Warn if operator is trying to disable themselves
+    if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
+        printf '\n'
+        warn "You are about to disable your own account ('${target}')."
+        plain "This will lock your password — you will not be able to log back in"
+        plain "with a password unless another sudo user re-enables this account."
+        ask "Continue anyway?" "n" || { info "Cancelled."; return 0; }
+    fi
 
     printf '\n'
     local status
@@ -542,7 +570,7 @@ action_change_password() {
 
     printf '\n'
     local new_password
-    new_password=$(_prompt_password "$target")
+    new_password=$(_prompt_password "$target") || { return 0; }
     _apply_password "$target" "$new_password"
 
     ok "Password updated for '${target}'."
@@ -567,12 +595,22 @@ action_rename() {
         return 0
     fi
 
+    # Warn if operator is trying to rename themselves
+    if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
+        printf '\n'
+        warn "You are about to rename your own account ('${target}')."
+        plain "Your current session will continue, but you must use the new name"
+        plain "for all future logins and sudo commands."
+        ask "Continue anyway?" "n" || { info "Cancelled."; return 0; }
+    fi
+
     printf '\n'
     local new_name
     while true; do
-        new_name=$(ask_val "New username for '${target}'")
+        new_name=$(ask_val "New username for '${target}' (Enter to cancel)")
         if [[ -z "$new_name" ]]; then
-            warn "Username cannot be blank."; continue
+            info "Cancelled."
+            return 0
         fi
         if ! [[ "$new_name" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
             warn "Invalid username '${new_name}'."
@@ -615,7 +653,9 @@ action_rename() {
 # Action: Change shell
 # =============================================================================
 action_change_shell() {
-    section "Change Shell"
+    section "Change Login Shell"
+    plain "Switches the default command interpreter that starts when this user logs in."
+    plain "Common choices: /bin/bash (default), /bin/zsh, /bin/fish, /bin/sh"
 
     local target
     target=$(pick_human_user "Username") || return 0
@@ -651,13 +691,17 @@ action_change_shell() {
     printf '\n'
     local choice idx new_shell
     while true; do
-        choice=$(ask_val "Shell number [1-${#shells[@]}]")
+        choice=$(ask_val "Shell number [1-${#shells[@]}], or Enter to cancel")
+        if [[ -z "$choice" ]]; then
+            info "Cancelled."
+            return 0
+        fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#shells[@]} )); then
             idx=$(( choice - 1 ))
             new_shell="${shells[$idx]}"
             break
         fi
-        warn "Please enter a number between 1 and ${#shells[@]}."
+        warn "Please enter a number between 1 and ${#shells[@]}, or Enter to cancel."
     done
 
     if [[ "$new_shell" == "$current_shell" ]]; then
@@ -666,7 +710,8 @@ action_change_shell() {
     fi
 
     run usermod -s "$new_shell" "$target"
-    ok "'${target}' shell set to ${new_shell}."
+    ok "'${target}' login shell set to ${new_shell}."
+    plain "The change takes effect the next time '${target}' opens a new session."
 }
 
 # =============================================================================
@@ -681,6 +726,10 @@ action_toggle_sudo() {
     printf '\n'
     if is_sudo_member "$target"; then
         warn "'${target}' is in the sudo group."
+        if [[ -n "$CURRENT_OPERATOR" && "$target" == "$CURRENT_OPERATOR" ]]; then
+            warn "This is your own account — removing sudo will lock you out of privileged commands."
+            plain "You will not be able to run sudo until another admin re-adds you."
+        fi
         if ask "Remove '${target}' from sudo?" "n"; then
             run gpasswd -d "$target" sudo
             ok "'${target}' removed from sudo."
@@ -783,6 +832,10 @@ action_manage_root() {
 # Main
 # =============================================================================
 
+# The operator is the human who invoked sudo (or root if no sudo context).
+# Used to warn when a destructive action targets the currently logged-in user.
+CURRENT_OPERATOR="${SUDO_USER:-}"
+
 # Initial user table
 if [[ -n "${SUDO_USER:-}" ]]; then
     info "Running as root via sudo (operator: ${SUDO_USER})."
@@ -811,10 +864,10 @@ _show_menu() {
     printf "    4)  Re-enable user\n"
     printf "    5)  Change password\n"
     printf "    6)  Rename user\n"
-    printf "    7)  Change shell\n"
-    printf "    8)  Sudo membership\n"
+    printf "    7)  Change login shell  ${DIM}(e.g. bash → zsh, fish)${NC}\n"
+    printf "    8)  Grant / revoke sudo access\n"
     if [[ "$docker_exists" == "true" ]]; then
-        printf "    9)  Docker membership\n"
+        printf "    9)  Grant / revoke Docker access\n"
         printf "   10)  %b\n" "$root_label"
         printf "   11)  Exit\n"
         _MENU_MAX=11
@@ -828,7 +881,7 @@ _show_menu() {
 # _menu_default — nudge toward the most useful action based on current state
 _menu_default() {
     (( HUMAN_COUNT == 0 )) && printf '1' && return
-    (( SUDO_COUNT  == 0 )) && printf '8' && return
+    (( SUDO_COUNT  == 0 )) && printf '8' && return   # nudge toward Grant / revoke sudo access
     printf ''
 }
 
