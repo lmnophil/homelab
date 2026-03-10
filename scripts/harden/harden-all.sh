@@ -120,11 +120,26 @@ SCRIPTS=()
 discover_scripts() {
     local self; self=$(basename "$0")
     local path
+    local users_script=""
+    local others=()
+
     for path in harden-*.sh; do
         [[ -f "$path" ]] || continue
         [[ "$(basename "$path")" == "$self" ]] && continue
-        SCRIPTS+=("$path")
+
+        if [[ "$(basename "$path")" == "harden-users.sh" ]]; then
+            users_script="$path"
+        else
+            others+=("$path")
+        fi
     done
+
+    # Ensure harden-users.sh runs first if present
+    if [[ -n "$users_script" ]]; then
+        SCRIPTS+=("$users_script")
+    fi
+
+    SCRIPTS+=("${others[@]}")
 }
 
 # ── Per-script status state ───────────────────────────────────────────────────
