@@ -164,11 +164,6 @@ CONF_SET_ALGORITHMS=false   # true → write explicit algorithm stanzas in drop-
 
 DIRTY=false   # set to true when any fix is accepted
 
-# ── Check tracking ────────────────────────────────────────────────────────────
-CHECKS_PASSED=()
-CHECKS_FIXED=()
-CHECKS_DECLINED=()
-
 # ── sshd_eff_val <key> ────────────────────────────────────────────────────────
 # Returns the effective value of an sshd directive.
 # Drop-in takes precedence over the main config.
@@ -1057,6 +1052,10 @@ DROPIN
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
+    CHECKS_PASSED=()
+    CHECKS_FIXED=()
+    CHECKS_DECLINED=()
+
     preflight_checks
     compute_state
 

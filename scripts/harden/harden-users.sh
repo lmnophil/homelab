@@ -106,6 +106,16 @@ ask_secret() {
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 # Sets globals: OS_ID  OS_CODENAME  OS_VERSION_ID  OS_MAJOR
 OS_ID=''; OS_CODENAME=''; OS_VERSION_ID=''; OS_MAJOR=0
+
+# ── User count globals (set by compute_user_counts; read by menu / checks) ───
+HUMAN_COUNT=0; SUDO_COUNT=0
+
+# ── Result globals for pick / prompt helpers ─────────────────────────────────
+# Using globals avoids $() command substitution capturing display output.
+_PICK_RESULT=''
+_USERNAME_RESULT=''
+_PASSWORD_RESULT=''
+
 preflight_checks() {
     [[ $EUID -eq 0 || "$DRY_RUN" == "true" ]] \
         || die "Root privileges required. Run as: sudo $0"
@@ -208,10 +218,15 @@ list_human_users() {
 }
 
 # ── Pick / prompt helpers ─────────────────────────────────────────────────────
+# pick_human_user PROMPT
+# Prompts for a valid non-root username. Retries on bad input.
+# Sets _PICK_RESULT; returns 1 (with info "Cancelled.") on blank input or when
+# no eligible users exist.  Never call with $() — use the global instead.
+# The caller is responsible for displaying the user list before calling this.
 pick_human_user() {
-    local prompt="$1" exclude="${2:-}" u users=()
+    local prompt="$1" u users=()
+    _PICK_RESULT=''
     while IFS= read -r u; do
-        [[ "$u" == "$exclude" ]] && continue
         users+=("$u")
     done < <(getent passwd 2>/dev/null \
         | awk -F: '$3 >= 1000 && $3 < 65534 { print $1 }' \
@@ -222,19 +237,19 @@ pick_human_user() {
         return 1
     fi
 
-    printf '\n'
-    list_human_users
-    printf '\n'
-
     local chosen found
     while true; do
-        chosen=$(ask_val "$prompt")
+        chosen=$(ask_val "${prompt} (Enter to cancel)")
+        if [[ -z "$chosen" ]]; then
+            info "Cancelled."
+            return 1
+        fi
         found=false
         for u in "${users[@]}"; do
             [[ "$u" == "$chosen" ]] && found=true && break
         done
         if [[ "$found" == "true" ]]; then
-            printf '%s' "$chosen"
+            _PICK_RESULT="$chosen"
             return 0
         fi
         warn "User '${chosen}' not found — please try again."
@@ -242,11 +257,13 @@ pick_human_user() {
 }
 
 _prompt_new_username() {
+    _USERNAME_RESULT=''
     local candidate
     while true; do
-        candidate=$(ask_val "New username")
+        candidate=$(ask_val "New username (Enter to cancel)")
         if [[ -z "$candidate" ]]; then
-            warn "Username cannot be blank."; continue
+            info "Cancelled."
+            return 1
         fi
         if ! [[ "$candidate" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
             warn "Invalid username '${candidate}'."
@@ -257,16 +274,22 @@ _prompt_new_username() {
         if id "$candidate" &>/dev/null; then
             warn "User '${candidate}' already exists."; continue
         fi
-        printf '%s' "$candidate"
+        _USERNAME_RESULT="$candidate"
         return 0
     done
 }
 
 _prompt_password() {
+    _PASSWORD_RESULT=''
     local username="$1" pw1 pw2
+    info "Leave both password fields blank to cancel."
     while true; do
         pw1=$(ask_secret "Password for ${username}")
         pw2=$(ask_secret "Confirm password")
+        if [[ -z "$pw1" && -z "$pw2" ]]; then
+            info "Cancelled."
+            return 1
+        fi
         if [[ "$pw1" != "$pw2" ]]; then
             warn "Passwords do not match — try again."
             continue
@@ -278,7 +301,7 @@ _prompt_password() {
             warn "Password is only ${#pw1} character(s) — 8 or more is recommended."
             ask "Continue with this short password?" "n" || continue
         fi
-        printf '%s' "$pw1"
+        _PASSWORD_RESULT="$pw1"
         return 0
     done
 }
@@ -377,8 +400,11 @@ check_sudo_users() {
         if (( HUMAN_COUNT > 0 )); then
             case "$sub_choice" in
                 1)
-                    local target
-                    target=$(pick_human_user "Username to grant sudo") || continue
+                    printf '\n'
+                    list_human_users
+                    printf '\n'
+                    pick_human_user "Username to grant sudo" || continue
+                    local target="$_PICK_RESULT"
                     run usermod -aG sudo "$target"
                     ok "'${target}' added to the sudo group."
                     CHECKS_FIXED+=("Granted sudo to '${target}'")
@@ -411,10 +437,11 @@ check_sudo_users() {
 }
 
 _create_sudo_user() {
-    local new_user new_password
+    _prompt_new_username || return 1
+    local new_user="$_USERNAME_RESULT"
 
-    new_user=$(_prompt_new_username)
-    new_password=$(_prompt_password "$new_user")
+    _prompt_password "$new_user" || return 1
+    local new_password="$_PASSWORD_RESULT"
 
     local _user_ref="$new_user"
     _harden_user_cleanup() {

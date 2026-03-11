@@ -115,6 +115,10 @@ OS_ID=''; OS_CODENAME=''; OS_VERSION_ID=''; OS_MAJOR=0
 # Set in main() before any action runs; used by action functions to detect
 # and warn/block self-targeting operations.
 CURRENT_OPERATOR=''
+
+# ── User count globals (set by compute_user_counts; read by _menu_default) ───
+HUMAN_COUNT=0; SUDO_COUNT=0
+
 preflight_checks() {
     [[ $EUID -eq 0 || "$DRY_RUN" == "true" ]] \
         || die "Root privileges required. Run as: sudo $0"
@@ -488,8 +492,9 @@ action_disable() {
     pick_human_user "Username to disable" || return 0
     local target="$_PICK_RESULT"
 
-    # Resolve SSH key status early — needed by both the self-warning and the main flow.
-    local auth_keys="/home/${target}/.ssh/authorized_keys"
+    # Resolve home directory and SSH key status early.
+    local target_home; target_home=$(getent passwd "$target" | cut -d: -f6)
+    local auth_keys="${target_home}/.ssh/authorized_keys"
     local keys_active=false
     [[ -f "$auth_keys" ]] && keys_active=true
 
@@ -581,10 +586,11 @@ action_enable() {
         run usermod -U "$target"
         ok "'${target}' re-enabled."
 
-        local auth_keys_disabled="/home/${target}/.ssh/authorized_keys.disabled"
+        local target_home; target_home=$(getent passwd "$target" | cut -d: -f6)
+        local auth_keys_disabled="${target_home}/.ssh/authorized_keys.disabled"
         if [[ -f "$auth_keys_disabled" ]]; then
             if ask "Also restore SSH authorized_keys?" "y"; then
-                run mv "$auth_keys_disabled" "/home/${target}/.ssh/authorized_keys"
+                run mv "$auth_keys_disabled" "${target_home}/.ssh/authorized_keys"
                 ok "SSH authorized_keys restored."
             fi
         fi
@@ -653,15 +659,28 @@ action_rename() {
         break
     done
 
-    local old_home="/home/${target}" new_home="/home/${new_name}"
+    local old_home; old_home=$(getent passwd "$target" | cut -d: -f6)
+    local new_home="${old_home%/*}/${new_name}"
     local has_primary_group=false
     getent group "$target" &>/dev/null && has_primary_group=true
 
     printf '\n'
     plain "  Login:  ${target}  →  ${new_name}"
-    [[ -d "$old_home" ]]             && plain "  Home:   ${old_home}  →  ${new_home}"
+    [[ -d "$old_home" ]]                 && plain "  Home:   ${old_home}  →  ${new_home}"
     [[ "$has_primary_group" == "true" ]] && plain "  Group:  ${target}  →  ${new_name}"
     ask "Proceed?" "y" || { info "No changes made."; return 0; }
+
+    # Multi-step operation — trap ERR to undo partial work on failure.
+    local _old_name="$target"
+    _rename_cleanup() {
+        [[ "$DRY_RUN" == "true" ]] && return
+        warn "Error during rename — attempting to roll back..."
+        id "$new_name" &>/dev/null \
+            && usermod -l "$_old_name" "$new_name" 2>/dev/null \
+            && warn "Login name restored to '${_old_name}'. Verify home dir manually." \
+            || warn "Could not roll back login name — check user state manually."
+    }
+    trap _rename_cleanup ERR
 
     run usermod -l "$new_name" "$target"
 
@@ -673,6 +692,8 @@ action_rename() {
         run groupmod -n "$new_name" "$target"
         ok "Primary group renamed '${target}' → '${new_name}'."
     fi
+
+    trap - ERR
 
     ok "Renamed '${target}' → '${new_name}'."
     [[ -d "$new_home" ]] && plain "Home directory moved to ${new_home}."

@@ -61,6 +61,15 @@ plain()   { printf "        %s\n"              "$1"; }
 die()     { err "$1"; exit 1; }
 section() { printf "\n${BOLD}  ── %s${NC}\n"   "$1"; }
 
+header() {
+    local title=" $1 " w=60
+    local pad=$(( (w - ${#title}) / 2 ))
+    local line; printf -v line '%*s' "$w" ''; line="${line// /─}"
+    printf "\n${BLUE}${BOLD}%s\n" "$line"
+    printf "%${pad}s%s\n" "" "$title"
+    printf "%s${NC}\n\n" "$line"
+}
+
 # ── run() ─────────────────────────────────────────────────────────────────────
 run() {
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -415,6 +424,7 @@ show_state() {
 # ── Menu ──────────────────────────────────────────────────────────────────────
 declare -a _MENU_ACTIONS=()
 _MENU_MAX=0
+MENU_DEFAULT=''
 
 _show_menu() {
     _MENU_ACTIONS=()
@@ -466,14 +476,10 @@ action_install() {
     printf '\n'
     info "Installing openssh-server via apt..."
     run apt-get install -y openssh-server
-    if [[ "$DRY_RUN" != "true" ]]; then
-        systemctl enable --now ssh 2>/dev/null \
-            || systemctl enable --now sshd 2>/dev/null \
-            || true
-        ok "openssh-server installed and service enabled"
-    else
-        printf "    ${DIM}[dry-run]${NC} systemctl enable --now ssh\n"
-    fi
+    run systemctl enable --now ssh 2>/dev/null \
+        || run systemctl enable --now sshd 2>/dev/null \
+        || true
+    [[ "$DRY_RUN" != "true" ]] && ok "openssh-server installed and service enabled"
 }
 
 # ── Action: start service ─────────────────────────────────────────────────────
@@ -481,12 +487,10 @@ action_start_service() {
     section "Start SSH Service"
     printf '\n'
     info "Starting SSH service..."
-    if [[ "$DRY_RUN" != "true" ]]; then
-        systemctl start ssh 2>/dev/null || systemctl start sshd 2>/dev/null || true
-        ok "SSH service started"
-    else
-        printf "    ${DIM}[dry-run]${NC} systemctl start ssh\n"
-    fi
+    run systemctl start ssh 2>/dev/null \
+        || run systemctl start sshd 2>/dev/null \
+        || true
+    [[ "$DRY_RUN" != "true" ]] && ok "SSH service started"
 }
 
 # ── Action: enable service ────────────────────────────────────────────────────
@@ -494,12 +498,10 @@ action_enable_service() {
     section "Enable SSH at Boot"
     printf '\n'
     info "Enabling SSH service at boot..."
-    if [[ "$DRY_RUN" != "true" ]]; then
-        systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
-        ok "SSH service enabled at boot"
-    else
-        printf "    ${DIM}[dry-run]${NC} systemctl enable ssh\n"
-    fi
+    run systemctl enable ssh 2>/dev/null \
+        || run systemctl enable sshd 2>/dev/null \
+        || true
+    [[ "$DRY_RUN" != "true" ]] && ok "SSH service enabled at boot"
 }
 
 # ── Action: add authorized keys ───────────────────────────────────────────────
@@ -1473,11 +1475,12 @@ main() {
         _show_menu
 
         local default; default=$(_menu_default)
+        MENU_DEFAULT="$default"
         local choice
-        if [[ -n "$default" ]]; then
-            read -rp $'\n'"    ${YELLOW}>  ${NC}Choice [1-${_MENU_MAX}, default ${default}]: " \
+        if [[ -n "$MENU_DEFAULT" ]]; then
+            read -rp $'\n'"    ${YELLOW}>  ${NC}Choice [1-${_MENU_MAX}, default ${MENU_DEFAULT}]: " \
                 choice || true
-            choice="${choice:-$default}"
+            choice="${choice:-$MENU_DEFAULT}"
         else
             read -rp $'\n'"    ${YELLOW}>  ${NC}Choice [1-${_MENU_MAX}]: " choice || true
         fi

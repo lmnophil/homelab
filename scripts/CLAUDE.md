@@ -236,7 +236,9 @@ ask_secret() {
 
 Declare the OS globals at module level (required by `set -u`) immediately
 before the function definition. Add any domain-specific globals that
-`preflight_checks` sets on the same lines.
+`preflight_checks` sets on the same lines. Any count or state globals read by
+helper functions (e.g. `HUMAN_COUNT`, `SUDO_COUNT`, `MENU_DEFAULT`) must also
+be declared at module level even if they are first assigned inside `main()`.
 
 ```bash
 OS_ID=''; OS_CODENAME=''; OS_VERSION_ID=''; OS_MAJOR=0
@@ -313,13 +315,20 @@ local w=50 div; printf -v div '%*s' "$w" ''; printf "    %s\n" "${div// /─}"
 
 ### Summary arrays
 
-Declare at the top of `main`. Each check function appends to exactly one array.
+Declare at the top of `main`, before any check function is called. Each check
+function appends to exactly one array.
 
 ```bash
 CHECKS_PASSED=()    # already correct — no action needed
 CHECKS_FIXED=()     # operator chose to fix it
 CHECKS_DECLINED=()  # operator skipped (risk accepted)
 ```
+
+Do **not** declare these at module level — they are only meaningful within a
+single run of `main()` and declaring them in `main()` makes that scope
+explicit. Because check functions are always called from inside `main()`, and
+bash arrays without `local` are global, all check functions see the same
+arrays.
 
 ### Check function structure
 
@@ -514,19 +523,21 @@ follow this pattern:
 4. Loop with `ask_val` until the operator gives a valid choice.
    **Always retry on bad input — never accept it and return an error code.**
 
-**Return convention — choose based on script family:**
+**Return convention — use result globals in ALL script families:**
 
-- **`harden-*`**: Return the value via `printf '%s' "$chosen"` and capture
-  with `$()`. This works because harden scripts call pick helpers before
-  displaying state tables, so display output is not swallowed.
-- **`manage-*`**: Use a result global (e.g. `_PICK_RESULT`). Command
-  substitution `$()` cannot be used here because `pick_human_user` calls
-  `list_human_users` internally — all that display output would be silently
-  captured instead of printed. Set the global inside the function and read
-  it at the call site.
+Command substitution `$()` cannot be used for pick or prompt helpers that
+print display output (warn/info/plain/list tables), because `$()` captures
+stdout — all that output would be silently swallowed instead of shown to the
+operator. Use a result global instead, declared at module level.
+
+- **All script families**: Use a result global (e.g. `_PICK_RESULT`). Set the
+  global inside the function and read it at the call site.
+- **Exception**: A pick helper that prints *nothing* (no state table, no
+  warn/info calls) may use `printf '%s' "$chosen"` and `$()` capture — but
+  this is rare. When in doubt, use a global.
 
 ```bash
-# manage-* pattern
+# All families — result global pattern
 _PICK_RESULT=''   # declare at module level
 
 pick_<entity>() {
@@ -558,30 +569,49 @@ pick_<entity> "Prompt text" || return 0
 local target="$_PICK_RESULT"
 ```
 
+**`harden-*` pick helpers**: Because check functions call pick helpers before
+any state table is shown, it can be tempting to embed `list_state` inside the
+pick function. **Do not do this.** Display the state table explicitly in the
+calling code before invoking the pick helper; the pick helper itself should
+only validate and return a value. This keeps the pick helper reusable and
+avoids the `$()` swallowing problem entirely.
+
 ### Input validation helpers — `_prompt_<thing>()`
 
 For any freeform input that must satisfy constraints (a path, an IP, a port, a
 key, a cron expression):
 
-1. Loop until input satisfies all constraints.
-2. Validate with a concrete regex or command; print rejection messages that
+1. Use a result global (e.g. `_USERNAME_RESULT`, `_PASSWORD_RESULT`) declared
+   at module level — same reason as pick helpers: validation warnings use
+   `warn`/`plain` which write to stdout, and `$()` capture would swallow them.
+2. Return 1 on blank input (blank = "cancel") with `info "Cancelled."`.
+3. Loop until input satisfies all constraints.
+4. Validate with a concrete regex or command; print rejection messages that
    explain exactly what the rule is.
 
 ```bash
+_USERNAME_RESULT=''   # declare at module level
+
 _prompt_<thing>() {
+    _<THING>_RESULT=''
     local candidate
     while true; do
-        candidate=$(ask_val "Prompt text")
+        candidate=$(ask_val "Prompt text (Enter to cancel)")
         if [[ -z "$candidate" ]]; then
-            warn "Cannot be blank."; continue
+            info "Cancelled."
+            return 1
         fi
         if ! <validation_test "$candidate">; then
             warn "Invalid — explain the rule."; continue
         fi
-        printf '%s' "$candidate"
+        _<THING>_RESULT="$candidate"
         return 0
     done
 }
+
+# Caller:
+_prompt_<thing> || return 0
+local value="$_<THING>_RESULT"
 ```
 
 ### Destructive action confirmation
@@ -660,6 +690,78 @@ run sed -i '...' "$cfg"   # or tee, awk, etc.
 
 ---
 
+### Home directory lookup
+
+Whenever an action needs the home directory of a target user, look it up from
+`/etc/passwd` via `getent` rather than constructing `/home/${username}`. This
+is correct even on systems where some home dirs live outside `/home`.
+
+```bash
+local target_home; target_home=$(getent passwd "$target" | cut -d: -f6)
+local auth_keys="${target_home}/.ssh/authorized_keys"
+```
+
+---
+
+## SSH Domain Patterns
+
+The SSH scripts write configuration exclusively through a drop-in file rather
+than modifying the base `sshd_config`. This keeps the base config pristine and
+makes all managed settings visible in one place.
+
+### Drop-in file convention
+
+All SSH configuration changes go to:
+```
+/etc/ssh/sshd_config.d/99-hardened.conf
+```
+
+The base `/etc/ssh/sshd_config` is never modified. The `99-` prefix ensures
+this drop-in is read last, giving it precedence over all other drop-ins.
+
+### Reading effective values
+
+To read the effective value of a directive (drop-in overrides base):
+
+```bash
+sshd_eff_val() {
+    local key="$1" val=""
+    val=$(grep -ih "^${key}[[:space:]]" "$SSHD_DROP_IN" 2>/dev/null \
+        | tail -1 | awk '{print $2}' || true)
+    if [[ -z "$val" ]]; then
+        val=$(grep -ih "^${key}[[:space:]]" "$SSHD_CONFIG" 2>/dev/null \
+            | tail -1 | awk '{print $2}' || true)
+    fi
+    printf '%s' "$val"
+}
+```
+
+### Writing and validating the drop-in
+
+1. Back up the existing drop-in with a timestamped `.bak` suffix.
+2. Write the new drop-in via `cat > "$SSHD_DROP_IN" << DROPIN`.
+3. Validate with `sshd -t`. On failure, restore the backup and reload.
+4. On success, reload sshd:
+   `systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true`
+
+### Authorized keys management
+
+- Keys are appended idempotently: check for duplicate `type blob` before
+  writing; skip if already present.
+- Write a labelled comment header before each source block so re-runs are
+  idempotent even if the file is edited externally.
+- Always set `chmod 700 ~/.ssh` and `chmod 600 ~/.ssh/authorized_keys`.
+- Use `chown -R user:user ~/.ssh` (with a fallback to `chown -R user` for
+  systems where the group name differs from the username).
+
+### Colour-coding SSH config values
+
+Use a `_conf_color()` helper that maps directive/value pairs to ANSI colours.
+This helper is called from both the state table and the edit-config table. Keep
+the logic in one place and call it from both display paths.
+
+---
+
 ## Conventions Checklist
 
 Use this for every new script, regardless of domain.
@@ -668,6 +770,8 @@ Use this for every new script, regardless of domain.
 - [ ] `#!/usr/bin/env bash` and `set -euo pipefail` at the top
 - [ ] Argument parsing block verbatim; domain env vars declared below `DRY_RUN`
 - [ ] `OS_ID=''; OS_CODENAME=''; OS_VERSION_ID=''; OS_MAJOR=0` declared before `preflight_checks()`
+- [ ] All domain count/state globals read by helpers declared at module level (e.g. `HUMAN_COUNT=0; SUDO_COUNT=0`)
+- [ ] All result globals for pick/prompt helpers declared at module level (e.g. `_PICK_RESULT=''`, `_USERNAME_RESULT=''`, `_PASSWORD_RESULT=''`)
 - [ ] Color block verbatim
 - [ ] All output helpers verbatim (`info` `ok` `warn` `err` `plain` `die` `section` `header`)
 - [ ] `run()` verbatim
@@ -685,7 +789,7 @@ Use this for every new script, regardless of domain.
 - [ ] Declining any fix is always possible; declined items appear in the final summary
 
 **`harden-*` specific**
-- [ ] `CHECKS_PASSED`, `CHECKS_FIXED`, `CHECKS_DECLINED` declared in `main`
+- [ ] `CHECKS_PASSED`, `CHECKS_FIXED`, `CHECKS_DECLINED` declared at the top of `main()` (not at module level)
 - [ ] Every check function appends to exactly one of the three arrays
 - [ ] All-pass early exit present before check functions run
 - [ ] Final state display uses `header()` followed by the summary loop with ✓ / ~ / ! symbols
@@ -697,14 +801,17 @@ Use this for every new script, regardless of domain.
 - [ ] Dynamic options hidden (not just disabled) when prerequisites are absent
 - [ ] Menu numbering in `_show_menu()` and the `case` statement are kept in sync
 - [ ] Exit is always the last numbered option
-- [ ] `pick_*` helpers use result globals (e.g. `_PICK_RESULT`), not `$()` capture
-- [ ] All result globals declared at module level before any function definition
+- [ ] `_MENU_MAX` and `MENU_DEFAULT` declared at module level
 
 **Domain-specific**
 - [ ] State query helpers are read-only and never wrapped in `run()`
+- [ ] Pick helpers use result globals (`_PICK_RESULT`) — never `$()` capture when the function prints output
+- [ ] Pick helpers do NOT call display functions (list tables, show_state) internally; the caller shows state before invoking the pick helper
+- [ ] Prompt helpers (`_prompt_*`) use result globals and return 1 on blank/cancel input
 - [ ] Selection helpers use a retry loop — never single-attempt with return-on-bad-input
 - [ ] Input validation helpers loop until valid
 - [ ] Destructive actions have at minimum an `ask` with default `n`; high-stakes actions require typing a confirmation string
 - [ ] Actions that modify config files back them up with a timestamped `.bak` suffix first
 - [ ] Multi-step operations use a named ERR trap for rollback
 - [ ] Prerequisite checks are at the top of any action that needs them, with a clear install hint
+- [ ] Home directory obtained from `getent passwd "$user" | cut -d: -f6`, never constructed as `/home/${user}`
