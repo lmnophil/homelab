@@ -4,7 +4,7 @@
 # ==============================================================================
 #
 # Usage:
-#   sudo ./harden-ssh.sh [--dry-run] [--help]
+#   sudo ./harden-ssh.sh [--dry-run] [--status] [--help]
 #
 # Checks performed:
 #   PubkeyAuthentication    PasswordAuthentication   KbdInteractiveAuthentication
@@ -19,16 +19,18 @@
 # restored automatically on failure.
 #
 # Requirements: Ubuntu 22.04+ or Debian 11+. Run as root or via sudo.
-#               --dry-run does not require root.
+#               --dry-run and --status do not require root.
 # ==============================================================================
 set -euo pipefail
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-false}"
+STATUS_MODE="${STATUS_MODE:-false}"
 
 for _arg in "$@"; do
     case "$_arg" in
-        --dry-run)  DRY_RUN=true ;;
+        --dry-run)  DRY_RUN=true     ;;
+        --status)   STATUS_MODE=true ;;
         --help|-h)
             sed -n '/^# Usage:/,/^# =====/p' "$0" | sed 's/^# \{0,3\}//'
             exit 0
@@ -59,6 +61,30 @@ err()     { printf "${RED}  [x]  ${NC}%s\n"    "$1" >&2; }
 plain()   { printf "        %s\n"              "$1"; }
 die()     { err "$1"; exit 1; }
 section() { printf "\n${BOLD}  ── %s${NC}\n"   "$1"; }
+
+# ── Status helpers ────────────────────────────────────────────────────────────
+# Used only in --status mode. Each entry is stored as "id|detail".
+# Detail is printed on the same line for PASS, indented below for FAIL.
+STATUS_PASS=()
+STATUS_FAIL=()
+status_pass() { STATUS_PASS+=("$1|${2:-}"); }
+status_fail() { STATUS_FAIL+=("$1|${2:-}"); }
+
+_emit_status() {
+    printf '%s\n' "$(basename "$0" .sh)"
+    local entry id detail
+    for entry in "${STATUS_PASS[@]+"${STATUS_PASS[@]}"}"; do
+        id="${entry%%|*}"; detail="${entry#*|}"
+        [[ -n "$detail" ]] \
+            && printf '  PASS  %s  %s\n' "$id" "$detail" \
+            || printf '  PASS  %s\n'    "$id"
+    done
+    for entry in "${STATUS_FAIL[@]+"${STATUS_FAIL[@]}"}"; do
+        id="${entry%%|*}"; detail="${entry#*|}"
+        printf '  FAIL  %s\n' "$id"
+        [[ -n "$detail" ]] && printf '        %s\n' "$detail"
+    done
+}
 
 header() {
     local title=" $1 " w=60
@@ -101,7 +127,7 @@ ask_val() {
 OS_ID=''; OS_CODENAME=''; OS_VERSION_ID=''; OS_MAJOR=0
 
 preflight_checks() {
-    [[ $EUID -eq 0 || "$DRY_RUN" == "true" ]] \
+    [[ $EUID -eq 0 || "$DRY_RUN" == "true" || "$STATUS_MODE" == "true" ]] \
         || die "Root privileges required. Run as: sudo $0"
 
     [[ -f /etc/os-release ]] \
@@ -163,6 +189,11 @@ CONF_TCP_FORWARDING="no"
 CONF_SET_ALGORITHMS=false   # true → write explicit algorithm stanzas in drop-in
 
 DIRTY=false   # set to true when any fix is accepted
+
+# ── Check tracking ────────────────────────────────────────────────────────────
+CHECKS_PASSED=()
+CHECKS_FIXED=()
+CHECKS_DECLINED=()
 
 # ── sshd_eff_val <key> ────────────────────────────────────────────────────────
 # Returns the effective value of an sshd directive.
@@ -301,7 +332,7 @@ _show_row() {
             color="$RED"
         fi
     fi
-    # MaxAuthTries — green ≤5, red >6
+    # MaxAuthTries — green ≤5, red >5
     if [[ "$key" == "MaxAuthTries" && "$val" =~ ^[0-9]+$ ]]; then
         (( val <= 5 )) && color="$GREEN" || color="$RED"
     fi
@@ -425,6 +456,7 @@ write_authorized_keys() {
 # ══════════════════════════════════════════════════════════════════════════════
 # CHECK FUNCTIONS
 # Each function: query state → return early if passing → explain → ask → fix.
+# In --status mode: populate STATUS_PASS / STATUS_FAIL and return immediately.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── sudo_ssh_user_exists ──────────────────────────────────────────────────────
@@ -451,6 +483,36 @@ sudo_ssh_user_exists() {
 # write sshd config. It appends to CHECKS_FIXED / CHECKS_DECLINED like all
 # other checks so the summary reflects the outcome.
 check_sudo_ssh_user() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        if sudo_ssh_user_exists; then
+            local _m _found=()
+            while IFS= read -r _m; do
+                [[ -z "$_m" || "$_m" == "root" ]] && continue
+                local _h; _h=$(getent passwd "$_m" 2>/dev/null | cut -d: -f6 || true)
+                [[ -z "$_h" ]] && continue
+                grep -q "^ssh-\|^ecdsa-\|^sk-" "${_h}/.ssh/authorized_keys" \
+                    2>/dev/null || continue
+                _found+=("$_m")
+            done < <( getent group sudo 2>/dev/null | cut -d: -f4 | tr ',' '\n' )
+            local _str; _str=$(IFS=', '; printf '%s' "${_found[*]}")
+            status_pass "sudo_ssh_key" "$_str"
+        else
+            local _has_members=false _m
+            while IFS= read -r _m; do
+                [[ -z "$_m" || "$_m" == "root" ]] && continue
+                getent passwd "$_m" &>/dev/null && _has_members=true && break
+            done < <( getent group sudo 2>/dev/null | cut -d: -f4 | tr ',' '\n' )
+            if [[ "$_has_members" == "false" ]]; then
+                status_fail "sudo_ssh_key" \
+                    "sudo group has no non-root members — add one first"
+            else
+                status_fail "sudo_ssh_key" \
+                    "no non-root sudo member has an authorized_keys entry"
+            fi
+        fi
+        return 0
+    fi
+
     if sudo_ssh_user_exists; then
         local _member _found_names=()
         while IFS= read -r _member; do
@@ -539,7 +601,7 @@ check_sudo_ssh_user() {
 
     local auth_file="${key_home}/.ssh/authorized_keys"
 
-    # Key source loop — URL / paste, same as manage-ssh.sh
+    # Key source loop — URL / paste
     if [[ "$URL_FETCH_AVAILABLE" == "true" ]]; then
         info "Tip: GitHub and GitLab expose all your keys at one URL:"
         plain "  https://github.com/USERNAME.keys   or   https://gitlab.com/USERNAME.keys"
@@ -651,6 +713,16 @@ check_sudo_ssh_user() {
 }
 
 check_pubkey_auth() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        if [[ "${CONF_PUBKEY_AUTH,,}" == "yes" ]]; then
+            status_pass "pubkey_auth"
+        else
+            status_fail "pubkey_auth" \
+                "PubkeyAuthentication is '${CONF_PUBKEY_AUTH}'  expected: yes"
+        fi
+        return 0
+    fi
+
     local cur="${CONF_PUBKEY_AUTH,,}"
     if [[ "$cur" == "yes" ]]; then
         ok "PubkeyAuthentication is yes"
@@ -673,6 +745,16 @@ check_pubkey_auth() {
 }
 
 check_password_auth() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        if [[ "${CONF_PASSWORD_AUTH,,}" == "no" ]]; then
+            status_pass "password_auth"
+        else
+            status_fail "password_auth" \
+                "PasswordAuthentication is '${CONF_PASSWORD_AUTH}'  expected: no"
+        fi
+        return 0
+    fi
+
     local cur="${CONF_PASSWORD_AUTH,,}"
     if [[ "$cur" == "no" ]]; then
         ok "PasswordAuthentication is no"
@@ -704,6 +786,16 @@ check_password_auth() {
 }
 
 check_kbd_auth() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        if [[ "${CONF_KBD_AUTH,,}" == "no" ]]; then
+            status_pass "kbd_auth"
+        else
+            status_fail "kbd_auth" \
+                "KbdInteractiveAuthentication is '${CONF_KBD_AUTH}'  expected: no"
+        fi
+        return 0
+    fi
+
     local cur="${CONF_KBD_AUTH,,}"
     if [[ "$cur" == "no" ]]; then
         ok "KbdInteractiveAuthentication is no"
@@ -727,6 +819,17 @@ check_kbd_auth() {
 }
 
 check_permit_root_login() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _cur="${CONF_PERMIT_ROOT_LOGIN,,}"
+        if [[ "$_cur" == "no" || "$_cur" == "prohibit-password" ]]; then
+            status_pass "permit_root_login" "$CONF_PERMIT_ROOT_LOGIN"
+        else
+            status_fail "permit_root_login" \
+                "PermitRootLogin is '${CONF_PERMIT_ROOT_LOGIN}'  expected: no or prohibit-password"
+        fi
+        return 0
+    fi
+
     local cur="${CONF_PERMIT_ROOT_LOGIN,,}"
     if [[ "$cur" == "no" || "$cur" == "prohibit-password" ]]; then
         ok "PermitRootLogin is ${CONF_PERMIT_ROOT_LOGIN}"
@@ -750,6 +853,14 @@ check_permit_root_login() {
 }
 
 check_empty_passwords() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_EMPTY_PASSWORDS,,}" == "no" ]] \
+            && status_pass "permit_empty_passwords" \
+            || status_fail "permit_empty_passwords" \
+                "currently: ${CONF_EMPTY_PASSWORDS}  expected: no"
+        return 0
+    fi
+
     local cur="${CONF_EMPTY_PASSWORDS,,}"
     if [[ "$cur" == "no" ]]; then
         ok "PermitEmptyPasswords is no"
@@ -772,6 +883,16 @@ check_empty_passwords() {
 }
 
 check_max_auth_tries() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _cur="$CONF_MAX_AUTH_TRIES"
+        if [[ "$_cur" =~ ^[0-9]+$ ]] && (( _cur <= 5 )); then
+            status_pass "max_auth_tries" "${_cur} (≤5)"
+        else
+            status_fail "max_auth_tries" "currently: ${_cur}  expected: ≤5"
+        fi
+        return 0
+    fi
+
     local cur="$CONF_MAX_AUTH_TRIES"
     if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur <= 5 )); then
         ok "MaxAuthTries is ${cur}"
@@ -795,6 +916,16 @@ check_max_auth_tries() {
 }
 
 check_login_grace_time() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _cur="$CONF_LOGIN_GRACE_TIME"
+        if [[ "$_cur" =~ ^[0-9]+$ ]] && (( _cur > 0 && _cur <= 60 )); then
+            status_pass "login_grace_time" "${_cur}s (≤60)"
+        else
+            status_fail "login_grace_time" "currently: ${_cur}s  expected: 1–60"
+        fi
+        return 0
+    fi
+
     local cur="$CONF_LOGIN_GRACE_TIME"
     if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur > 0 && cur <= 60 )); then
         ok "LoginGraceTime is ${cur}s"
@@ -817,6 +948,19 @@ check_login_grace_time() {
 }
 
 check_idle_timeout() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _iv="$CONF_ALIVE_INTERVAL" _ic="$CONF_ALIVE_COUNT"
+        if [[ "$_iv" =~ ^[0-9]+$ && "$_ic" =~ ^[0-9]+$ ]] \
+            && (( _iv > 0 && _ic > 0 )); then
+            local _mins=$(( (_iv * _ic + 59) / 60 ))
+            status_pass "idle_timeout" "~${_mins}min (${_iv}s × ${_ic})"
+        else
+            status_fail "idle_timeout" \
+                "ClientAliveInterval=${_iv}  ClientAliveCountMax=${_ic}  expected: both >0"
+        fi
+        return 0
+    fi
+
     local iv="$CONF_ALIVE_INTERVAL" ic="$CONF_ALIVE_COUNT"
     if [[ "$iv" =~ ^[0-9]+$ && "$ic" =~ ^[0-9]+$ ]] \
         && (( iv > 0 && ic > 0 )); then
@@ -843,6 +987,13 @@ check_idle_timeout() {
 }
 
 check_x11_forwarding() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_X11_FORWARDING,,}" == "no" ]] \
+            && status_pass "x11_forwarding" \
+            || status_fail "x11_forwarding" "currently: ${CONF_X11_FORWARDING}  expected: no"
+        return 0
+    fi
+
     local cur="${CONF_X11_FORWARDING,,}"
     if [[ "$cur" == "no" ]]; then
         ok "X11Forwarding is no"
@@ -866,6 +1017,13 @@ check_x11_forwarding() {
 }
 
 check_tcp_forwarding() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_TCP_FORWARDING,,}" == "no" ]] \
+            && status_pass "tcp_forwarding" \
+            || status_fail "tcp_forwarding" "currently: ${CONF_TCP_FORWARDING}  expected: no"
+        return 0
+    fi
+
     local cur="${CONF_TCP_FORWARDING,,}"
     if [[ "$cur" == "no" ]]; then
         ok "AllowTcpForwarding is no"
@@ -889,6 +1047,13 @@ check_tcp_forwarding() {
 }
 
 check_algorithms() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "$CONF_SET_ALGORITHMS" == "true" ]] \
+            && status_pass "algorithms" \
+            || status_fail "algorithms" "no explicit algorithm stanzas in drop-in"
+        return 0
+    fi
+
     if [[ "$CONF_SET_ALGORITHMS" == "true" ]]; then
         ok "Explicit modern algorithm stanzas are present in the drop-in"
         CHECKS_PASSED+=("Modern algorithms explicitly configured")
@@ -1052,12 +1217,25 @@ DROPIN
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
-    CHECKS_PASSED=()
-    CHECKS_FIXED=()
-    CHECKS_DECLINED=()
-
     preflight_checks
     compute_state
+
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        check_sudo_ssh_user
+        check_pubkey_auth
+        check_password_auth
+        check_kbd_auth
+        check_permit_root_login
+        check_empty_passwords
+        check_max_auth_tries
+        check_login_grace_time
+        check_idle_timeout
+        check_x11_forwarding
+        check_tcp_forwarding
+        check_algorithms
+        _emit_status
+        [[ ${#STATUS_FAIL[@]} -eq 0 ]] && exit 0 || exit 1
+    fi
 
     printf '\n'
     printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"

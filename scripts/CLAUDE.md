@@ -113,14 +113,22 @@ fences because it acts as a document header, not a section separator:
 lines immediately below, following the same `VAR="${VAR:-default}"` pattern.
 Document them in the script header under `# Environment variables:`.
 
+`STATUS_MODE` is always present in `harden-*` scripts. When true, the script
+runs all check functions (each records pass/fail silently into STATUS_PASS /
+STATUS_FAIL arrays instead of prompting), then calls `_emit_status` and exits
+0 (all pass) or 1 (any fail) — no prompts, no mutations. `--status` does not
+require root (state queries are read-only).
+
 ```bash
 DRY_RUN="${DRY_RUN:-false}"
-# domain-specific env vars go here, e.g.:
+STATUS_MODE="${STATUS_MODE:-false}"
+# domain-specific env vars go here, e.g.:\r
 # SOME_VAR="${SOME_VAR:-}"
 
 for _arg in "$@"; do
     case "$_arg" in
         --dry-run)  DRY_RUN=true ;;
+        --status)   STATUS_MODE=true ;;
         --help|-h)
             sed -n '/^# Usage:/,/^# =====/p' "$0" | sed 's/^# \{0,3\}//'
             exit 0
@@ -170,6 +178,45 @@ Intended use:
 - `plain`   — continuation lines under an `ok`/`info`/`warn`; no prefix icon
 - `die`     — print error to stderr and `exit 1`
 - `section` — named heading before a logical group of work
+
+### Status helpers — `harden-*` scripts only
+
+Used to record per-check outcomes in `--status` mode. Each entry is stored as
+`"id|detail"`. Detail is printed inline for PASS and indented below for FAIL.
+Declare the arrays at module level (required by `set -u`).
+
+```bash
+STATUS_PASS=()
+STATUS_FAIL=()
+status_pass() { STATUS_PASS+=("$1|${2:-}"); }
+status_fail() { STATUS_FAIL+=("$1|${2:-}"); }
+
+_emit_status() {
+    printf '%s\n' "$(basename "$0" .sh)"
+    local entry id detail
+    for entry in "${STATUS_PASS[@]+"${STATUS_PASS[@]}"}"; do
+        id="${entry%%|*}"; detail="${entry#*|}"
+        [[ -n "$detail" ]] \
+            && printf '  PASS  %s  %s\n' "$id" "$detail" \
+            || printf '  PASS  %s\n'    "$id"
+    done
+    for entry in "${STATUS_FAIL[@]+"${STATUS_FAIL[@]}"}"; do
+        id="${entry%%|*}"; detail="${entry#*|}"
+        printf '  FAIL  %s\n' "$id"
+        [[ -n "$detail" ]] && printf '        %s\n' "$detail"
+    done
+}
+```
+
+Output format (machine-parseable, one script per invocation):
+
+```
+harden-ssh
+  PASS  pubkey_auth
+  PASS  idle_timeout  ~10min (300s × 2)
+  FAIL  password_auth
+        PasswordAuthentication is 'yes'  expected: no
+```
 
 ### `header()` — section title with ruled border
 
@@ -250,7 +297,7 @@ this function after the OS checks.
 
 ```bash
 preflight_checks() {
-    [[ $EUID -eq 0 || "$DRY_RUN" == "true" ]] \
+    [[ $EUID -eq 0 || "$DRY_RUN" == "true" || "$STATUS_MODE" == "true" ]] \
         || die "Root privileges required. Run as: sudo $0"
 
     [[ -f /etc/os-release ]] \
@@ -789,9 +836,13 @@ Use this for every new script, regardless of domain.
 - [ ] Declining any fix is always possible; declined items appear in the final summary
 
 **`harden-*` specific**
-- [ ] `CHECKS_PASSED`, `CHECKS_FIXED`, `CHECKS_DECLINED` declared at the top of `main()` (not at module level)
-- [ ] Every check function appends to exactly one of the three arrays
-- [ ] All-pass early exit present before check functions run
+- [ ] `CHECKS_PASSED`, `CHECKS_FIXED`, `CHECKS_DECLINED` declared at the top of `main()` (not at module level), before the banner
+- [ ] `STATUS_MODE` flag declared alongside `DRY_RUN`; `--status` case present in argument parsing
+- [ ] `STATUS_PASS=()`, `STATUS_FAIL=()`, `status_pass()`, `status_fail()`, `_emit_status()` declared at module level
+- [ ] `--status` path in `main()` is **before the banner**: runs all check functions (each calls `status_pass`/`status_fail` and returns immediately), calls `_emit_status`, exits 0 if `${#STATUS_FAIL[@]} -eq 0` else exits 1 — no prompts, no mutations
+- [ ] Every check function has a `STATUS_MODE` branch at the top: calls `status_pass`/`status_fail` with a stable `snake_case` id and a human-readable detail string, then `return 0`
+- [ ] Every check function appends to exactly one of the three summary arrays in its interactive path
+- [ ] All-pass early exit present before check functions run; prints full summary loop before `exit 0`
 - [ ] Final state display uses `header()` followed by the summary loop with ✓ / ~ / ! symbols
 - [ ] Closing message matches outcome: all-pass / some-fixed / some-declined
 

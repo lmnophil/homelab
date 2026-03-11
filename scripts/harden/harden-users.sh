@@ -6,10 +6,11 @@
 # Compatible with Debian 11+ and Ubuntu 22.04+.
 #
 # Usage:
-#   sudo ./harden-users.sh [--dry-run]
+#   sudo ./harden-users.sh [--dry-run] [--status] [--help]
 #
 # Options:
 #   --dry-run          Print commands without executing them
+#   --status           Report pass/fail for each check; no prompts, no changes
 #   --help             Show this help text
 #
 # Checks performed (in order):
@@ -25,10 +26,12 @@ set -euo pipefail
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-false}"
+STATUS_MODE="${STATUS_MODE:-false}"
 
 for _arg in "$@"; do
     case "$_arg" in
         --dry-run)  DRY_RUN=true ;;
+        --status)   STATUS_MODE=true ;;
         --help|-h)
             sed -n '/^# Usage:/,/^# =====/p' "$0" | sed 's/^# \{0,3\}//'
             exit 0
@@ -59,6 +62,30 @@ err()     { printf "${RED}  [x]  ${NC}%s\n"    "$1" >&2; }
 plain()   { printf "        %s\n"              "$1"; }
 die()     { err "$1"; exit 1; }
 section() { printf "\n${BOLD}  ── %s${NC}\n"   "$1"; }
+
+# ── Status helpers ────────────────────────────────────────────────────────────
+# Used only in --status mode. Each entry is stored as "id|detail".
+# Detail is printed on the same line for PASS, indented below for FAIL.
+STATUS_PASS=()
+STATUS_FAIL=()
+status_pass() { STATUS_PASS+=("$1|${2:-}"); }
+status_fail() { STATUS_FAIL+=("$1|${2:-}"); }
+
+_emit_status() {
+    printf '%s\n' "$(basename "$0" .sh)"
+    local entry id detail
+    for entry in "${STATUS_PASS[@]+"${STATUS_PASS[@]}"}"; do
+        id="${entry%%|*}"; detail="${entry#*|}"
+        [[ -n "$detail" ]] \
+            && printf '  PASS  %s  %s\n' "$id" "$detail" \
+            || printf '  PASS  %s\n'    "$id"
+    done
+    for entry in "${STATUS_FAIL[@]+"${STATUS_FAIL[@]}"}"; do
+        id="${entry%%|*}"; detail="${entry#*|}"
+        printf '  FAIL  %s\n' "$id"
+        [[ -n "$detail" ]] && printf '        %s\n' "$detail"
+    done
+}
 
 header() {
     local title=" $1 " w=60
@@ -117,7 +144,7 @@ _USERNAME_RESULT=''
 _PASSWORD_RESULT=''
 
 preflight_checks() {
-    [[ $EUID -eq 0 || "$DRY_RUN" == "true" ]] \
+    [[ $EUID -eq 0 || "$DRY_RUN" == "true" || "$STATUS_MODE" == "true" ]] \
         || die "Root privileges required. Run as: sudo $0"
 
     [[ -f /etc/os-release ]] \
@@ -359,6 +386,22 @@ show_harden_state() {
 
 # ── Check 1 — Ensure at least one non-root sudo user exists ──────────────────
 check_sudo_users() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        compute_user_counts
+        if (( SUDO_COUNT > 0 )); then
+            local _sudo_names=() _u
+            while IFS= read -r _u; do
+                is_sudo_member "$_u" && _sudo_names+=("$_u") || true
+            done < <(getent passwd 2>/dev/null \
+                | awk -F: '$3 >= 1000 && $3 < 65534 { print $1 }' || true)
+            local _names_str; _names_str=$(printf '%s, ' "${_sudo_names[@]}")
+            status_pass "non_root_sudo_user" "${_names_str%, }"
+        else
+            status_fail "non_root_sudo_user" "no non-root user in the sudo group"
+        fi
+        return 0
+    fi
+
     compute_user_counts
 
     if (( SUDO_COUNT > 0 )); then
@@ -476,6 +519,16 @@ _create_sudo_user() {
 
 # ── Check 2 — Ensure root password is locked ─────────────────────────────────
 check_root_locked() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        if ! is_root_pw_enabled; then
+            status_pass "root_password_locked"
+        else
+            status_fail "root_password_locked" \
+                "active password set — lock with: passwd -l root"
+        fi
+        return 0
+    fi
+
     if ! is_root_pw_enabled; then
         ok "Root password is locked."
         CHECKS_PASSED+=("Root password is already locked")
@@ -500,7 +553,18 @@ check_root_locked() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
+    CHECKS_PASSED=()
+    CHECKS_FIXED=()
+    CHECKS_DECLINED=()
+
     preflight_checks
+
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        check_sudo_users
+        check_root_locked
+        _emit_status
+        [[ ${#STATUS_FAIL[@]} -eq 0 ]] && exit 0 || exit 1
+    fi
 
     printf '\n'
     printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"
@@ -510,14 +574,22 @@ main() {
     printf "  OS:       ${BOLD}%s %s (%s)${NC}\n"   "$OS_ID" "$OS_CODENAME" "$OS_VERSION_ID"
     printf "  Dry-run:  ${BOLD}%s${NC}\n\n"         "$DRY_RUN"
 
-    CHECKS_PASSED=()
-    CHECKS_FIXED=()
-    CHECKS_DECLINED=()
-
     compute_user_counts
     if (( SUDO_COUNT > 0 )) && ! is_root_pw_enabled; then
         show_harden_state
         ok "All hardening checks pass. No action needed."
+        printf '\n'
+        printf "  ${BOLD}Summary${NC}\n\n"
+        for msg in "${CHECKS_PASSED[@]+"${CHECKS_PASSED[@]}"}"; do
+            printf "  ${GREEN}  ✓${NC}  %s\n" "$msg"
+        done
+        for msg in "${CHECKS_FIXED[@]+"${CHECKS_FIXED[@]}"}"; do
+            printf "  ${CYAN}  ~${NC}  %s\n" "$msg"
+        done
+        for msg in "${CHECKS_DECLINED[@]+"${CHECKS_DECLINED[@]}"}"; do
+            printf "  ${YELLOW}  !${NC}  %s\n" "$msg"
+        done
+        printf '\n'
         exit 0
     fi
 

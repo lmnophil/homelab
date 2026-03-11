@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# run-all.sh  —  Launcher menu for all manage-*.sh scripts in the same folder
+# run-manage-all.sh  —  Launcher menu for all manage-*.sh scripts in the same folder
 # ==============================================================================
 #
 # Usage:
-#   sudo ./run-all.sh [--help]
+#   sudo ./run-manage-all.sh [--help]
 #
 # Description:
 #   Discovers every manage-*.sh script in the same directory (excluding itself),
@@ -82,7 +82,7 @@ MANAGE_LABELS=()
 _banner() {
     printf "\n${BLUE}${BOLD}"
     printf "  ┌─────────────────────────────────────────────────┐\n"
-    printf "  │              run-all  —  launcher             │\n"
+    printf "  │              run-manage-all  —  launcher             │\n"
     printf "  └─────────────────────────────────────────────────┘\n"
     printf "${NC}\n"
 }
@@ -125,7 +125,7 @@ _launch() {
     printf '\n'
 
     # Run in a subshell so exits and errors in the child do not terminate
-    # run-all. The || true absorbs any non-zero exit from the child.
+    # run-manage-all. The || true absorbs any non-zero exit from the child.
     if [[ -x "$target" ]]; then
         ( "$target" ) || true
     else
@@ -133,7 +133,7 @@ _launch() {
     fi
 
     printf '\n'
-    info "Returned to run-all."
+    info "Returned to run-manage-all."
 }
 
 # ── Preflight ─────────────────────────────────────────────────────────────────

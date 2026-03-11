@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# run-all.sh — Orchestrate all harden-*.sh scripts in the current directory
+# run-harden-all.sh — Orchestrate all harden-*.sh scripts in the current directory
 # ==============================================================================
 # Discovers every harden-*.sh file in the current directory (excluding itself),
 # runs each with --status to produce a unified report, then offers to run the
 # full interactive script for every domain that has outstanding failures.
 #
 # Usage:
-#   sudo ./run-all.sh [--status] [--dry-run] [--help]
+#   sudo ./run-harden-all.sh [--status] [--dry-run] [--help]
 #
 # Options:
 #   --status    Run all harden-*.sh in status mode and report; no prompts
@@ -355,7 +355,7 @@ main() {
     # ── Banner ────────────────────────────────────────────────────────────────
     printf '\n'
     printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"
-    printf "${BLUE}${BOLD}  │                   run-all.sh                     │${NC}\n"
+    printf "${BLUE}${BOLD}  │                   run-harden-all.sh                     │${NC}\n"
     printf "${BLUE}${BOLD}  └─────────────────────────────────────────────────────┘${NC}\n"
     printf "  Host:     ${BOLD}%s${NC}\n"            "$(hostname)"
     printf "  OS:       ${BOLD}%s %s (%s)${NC}\n"   "$OS_ID" "$OS_CODENAME" "$OS_VERSION_ID"
