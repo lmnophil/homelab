@@ -63,8 +63,6 @@ die()     { err "$1"; exit 1; }
 section() { printf "\n${BOLD}  ── %s${NC}\n"   "$1"; }
 
 # ── Status helpers ────────────────────────────────────────────────────────────
-# Used only in --status mode. Each entry is stored as "id|detail".
-# Detail is printed on the same line for PASS, indented below for FAIL.
 STATUS_PASS=()
 STATUS_FAIL=()
 status_pass() { STATUS_PASS+=("$1|${2:-}"); }
@@ -147,9 +145,22 @@ preflight_checks() {
         *)      die "Unsupported OS '${OS_ID}'. Requires Ubuntu or Debian." ;;
     esac
 
-    dpkg-query -W -f='${Status}' openssh-server 2>/dev/null \
-        | grep -q "install ok installed" \
-        || die "openssh-server is not installed. Install it first: sudo apt install openssh-server"
+    # ── openssh-server: offer to install if missing ───────────────────────────
+    if ! dpkg-query -W -f='${Status}' openssh-server 2>/dev/null \
+            | grep -q "install ok installed"; then
+        warn "openssh-server is not installed."
+        if [[ "$DRY_RUN" == "true" || "$STATUS_MODE" == "true" ]]; then
+            die "openssh-server is required. Install it first: sudo apt install openssh-server"
+        fi
+        if ask "Install openssh-server now?" "y"; then
+            info "Running: apt-get install -y openssh-server"
+            apt-get install -y openssh-server \
+                || die "Installation failed. Install openssh-server manually and re-run."
+            ok "openssh-server installed."
+        else
+            die "openssh-server is required. Install it and re-run this script."
+        fi
+    fi
 
     # Detect URL-fetch capability (curl preferred, wget as fallback; neither is fatal)
     CURL_AVAILABLE=false
@@ -170,10 +181,6 @@ WGET_AVAILABLE=false
 URL_FETCH_AVAILABLE=false
 
 # ── Desired configuration (populated in compute_state, modified by checks) ───
-# Values here are the recommended secure defaults. Check functions compare the
-# effective config against these; when a fix is accepted they stay as-is;
-# when declined they are updated to the current effective value so the drop-in
-# preserves the status quo for that directive.
 CONF_PORT="22"
 CONF_PUBKEY_AUTH="yes"
 CONF_PASSWORD_AUTH="no"
@@ -186,18 +193,36 @@ CONF_ALIVE_INTERVAL="300"
 CONF_ALIVE_COUNT="2"
 CONF_X11_FORWARDING="no"
 CONF_TCP_FORWARDING="no"
-CONF_SET_ALGORITHMS=false   # true → write explicit algorithm stanzas in drop-in
+CONF_SET_ALGORITHMS=false
 
-DIRTY=false   # set to true when any fix is accepted
+DIRTY=false
 
 # ── Check tracking ────────────────────────────────────────────────────────────
 CHECKS_PASSED=()
 CHECKS_FIXED=()
 CHECKS_DECLINED=()
 
+# ── Proposed-fix arrays (populated by detect_issues) ─────────────────────────
+# Parallel arrays; one entry per issue found.
+PROP_ID=()        # internal key, e.g. "password_auth"
+PROP_NAME=()      # display name, e.g. "PasswordAuthentication"
+PROP_CURRENT=()   # current effective value
+PROP_TARGET=()    # recommended secure value
+PROP_REASON=()    # one-line rationale
+PROP_ACCEPTED=()  # "true" / "false" — filled by review_proposed_changes
+
+# Add one proposed fix to the arrays (default: accepted).
+_propose() {
+    local id="$1" name="$2" current="$3" target="$4" reason="$5"
+    PROP_ID+=("$id")
+    PROP_NAME+=("$name")
+    PROP_CURRENT+=("$current")
+    PROP_TARGET+=("$target")
+    PROP_REASON+=("$reason")
+    PROP_ACCEPTED+=("true")
+}
+
 # ── sshd_eff_val <key> ────────────────────────────────────────────────────────
-# Returns the effective value of an sshd directive.
-# Drop-in takes precedence over the main config.
 sshd_eff_val() {
     local key="$1" val=""
     val=$(grep -ih "^${key}[[:space:]]" "$SSHD_DROP_IN" 2>/dev/null \
@@ -210,9 +235,6 @@ sshd_eff_val() {
 }
 
 # ── compute_state ─────────────────────────────────────────────────────────────
-# Reads the effective sshd config and initialises CONF_* to current values.
-# Check functions will then override CONF_* to the secure value when fixed, or
-# leave them at the current value when declined.
 compute_state() {
     local v
     v=$(sshd_eff_val "Port");                         CONF_PORT="${v:-22}"
@@ -228,13 +250,11 @@ compute_state() {
     v=$(sshd_eff_val "X11Forwarding");                CONF_X11_FORWARDING="${v:-no}"
     v=$(sshd_eff_val "AllowTcpForwarding");           CONF_TCP_FORWARDING="${v:-yes}"
 
-    # Modern algorithms: check whether the drop-in already sets them
     grep -q "^HostKeyAlgorithms" "$SSHD_DROP_IN" 2>/dev/null \
         && CONF_SET_ALGORITHMS=true || CONF_SET_ALGORITHMS=false
 }
 
 # ── check_all_pass ────────────────────────────────────────────────────────────
-# Returns 0 if every check would pass right now, 1 otherwise.
 check_all_pass() {
     [[ "${CONF_PUBKEY_AUTH,,}"       == "yes" ]] || return 1
     [[ "${CONF_PASSWORD_AUTH,,}"     == "no"  ]] || return 1
@@ -279,7 +299,6 @@ show_state() {
 
     printf '\n'
 
-    # ── Sudo users key inventory ───────────────────────────────────────────────
     local dv_u dv_k dv_h
     printf -v dv_u '%*s' 18 ''; dv_u="${dv_u// /─}"
     printf -v dv_k '%*s' 5  ''; dv_k="${dv_k// /─}"
@@ -314,17 +333,12 @@ show_state() {
     printf '\n'
 }
 
-# _show_row <key> <value> <good_val_or_empty> <bad_val_or_empty>
-# good="" → green only when value != <default>/<unset>
-# good="x" → green only when value equals "x"  (case-insensitive)
-# bad="x"  → red when value equals "x"          (case-insensitive)
 _show_row() {
     local key="$1" val="$2" good="$3" bad="$4"
     local color="$YELLOW"
     local lval="${val,,}"
     [[ -n "$good" && "${lval}" == "${good,,}" ]] && color="$GREEN"
     [[ -n "$bad"  && "${lval}" == "${bad,,}"  ]] && color="$RED"
-    # Special: PermitRootLogin — "no" and "prohibit-password" are both green
     if [[ "$key" == "PermitRootLogin" ]]; then
         if [[ "$lval" == "no" || "$lval" == "prohibit-password" ]]; then
             color="$GREEN"
@@ -332,28 +346,22 @@ _show_row() {
             color="$RED"
         fi
     fi
-    # MaxAuthTries — green ≤5, red >5
     if [[ "$key" == "MaxAuthTries" && "$val" =~ ^[0-9]+$ ]]; then
         (( val <= 5 )) && color="$GREEN" || color="$RED"
     fi
-    # LoginGraceTime — green ≤60, yellow >60
     if [[ "$key" == "LoginGraceTime" && "$val" =~ ^[0-9]+$ ]]; then
         (( val <= 60 )) && color="$GREEN" || color="$YELLOW"
     fi
-    # ClientAliveInterval / Count — green >0, red ==0
     if [[ "$key" == "ClientAliveInterval" && "$val" =~ ^[0-9]+$ ]]; then
         (( val > 0 )) && color="$GREEN" || color="$RED"
     fi
     if [[ "$key" == "ClientAliveCountMax" && "$val" =~ ^[0-9]+$ ]]; then
         (( val > 0 )) && color="$GREEN" || color="$YELLOW"
     fi
-
     printf "    ${color}%-36s %s${NC}\n" "$key" "$val"
 }
 
 # ── show_key_help ─────────────────────────────────────────────────────────────
-# Explains how to generate an SSH key on Ubuntu/Linux and Windows, then how to
-# provide it here (paste or URL).
 show_key_help() {
     printf '\n'
     section "How to create an SSH key"
@@ -386,7 +394,6 @@ show_key_help() {
 }
 
 # ── show_url_help ──────────────────────────────────────────────────────────────
-# Explains how to add SSH keys to GitHub / GitLab and use the .keys URL.
 show_url_help() {
     printf '\n'
     section "How to use a Git hosting URL for SSH keys"
@@ -409,9 +416,7 @@ show_url_help() {
     printf '\n'
 }
 
-# ── write_authorized_keys <user> <home> <auth_file> <keys_block> <label> ─────
-# Appends unique, valid public keys from keys_block to auth_file.
-# Writes a labelled section header so duplicate runs are idempotent.
+# ── write_authorized_keys ─────────────────────────────────────────────────────
 write_authorized_keys() {
     local user="$1" home="$2" auth_file="$3" keys_block="$4" label="$5"
     local added=0 datestamp; datestamp=$(date '+%Y-%m-%d')
@@ -454,15 +459,11 @@ write_authorized_keys() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHECK FUNCTIONS
-# Each function: query state → return early if passing → explain → ask → fix.
-# In --status mode: populate STATUS_PASS / STATUS_FAIL and return immediately.
+# DETECTION FUNCTIONS
+# Populate STATUS_PASS/STATUS_FAIL (--status mode) or PROP_* arrays (normal).
+# No interactive prompting here.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── sudo_ssh_user_exists ──────────────────────────────────────────────────────
-# Returns 0 if at least one non-root member of the sudo group has an authorized
-# SSH key. Used as a safety pre-condition before recommending lockdown of
-# PasswordAuthentication and PermitRootLogin.
 sudo_ssh_user_exists() {
     local member
     while IFS= read -r member; do
@@ -475,13 +476,431 @@ sudo_ssh_user_exists() {
     return 1
 }
 
-# ── check_sudo_ssh_user ───────────────────────────────────────────────────────
-# Ensures there is at least one non-root sudoer with an SSH key in place.
-# When none exists, lists eligible users and offers to add keys inline using
-# the same URL / paste options as manage-ssh.sh.
-# This is a pre-condition check — not included in check_all_pass and does not
-# write sshd config. It appends to CHECKS_FIXED / CHECKS_DECLINED like all
-# other checks so the summary reflects the outcome.
+detect_pubkey_auth() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_PUBKEY_AUTH,,}" == "yes" ]] \
+            && status_pass "pubkey_auth" \
+            || status_fail "pubkey_auth" \
+                "PubkeyAuthentication is '${CONF_PUBKEY_AUTH}'  expected: yes"
+        return
+    fi
+    [[ "${CONF_PUBKEY_AUTH,,}" == "yes" ]] && return
+    _propose "pubkey_auth" "PubkeyAuthentication" "$CONF_PUBKEY_AUTH" "yes" \
+        "Key-based login is currently disabled; password lockout won't be safe without it"
+}
+
+detect_password_auth() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_PASSWORD_AUTH,,}" == "no" ]] \
+            && status_pass "password_auth" \
+            || status_fail "password_auth" \
+                "PasswordAuthentication is '${CONF_PASSWORD_AUTH}'  expected: no"
+        return
+    fi
+    [[ "${CONF_PASSWORD_AUTH,,}" == "no" ]] && return
+    _propose "password_auth" "PasswordAuthentication" "$CONF_PASSWORD_AUTH" "no" \
+        "Password auth exposes the server to brute-force attacks"
+}
+
+detect_kbd_auth() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_KBD_AUTH,,}" == "no" ]] \
+            && status_pass "kbd_auth" \
+            || status_fail "kbd_auth" \
+                "KbdInteractiveAuthentication is '${CONF_KBD_AUTH}'  expected: no"
+        return
+    fi
+    [[ "${CONF_KBD_AUTH,,}" == "no" ]] && return
+    _propose "kbd_auth" "KbdInteractiveAuthentication" "$CONF_KBD_AUTH" "no" \
+        "Can allow password-style prompts even when PasswordAuthentication is off"
+}
+
+detect_permit_root_login() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _cur="${CONF_PERMIT_ROOT_LOGIN,,}"
+        if [[ "$_cur" == "no" || "$_cur" == "prohibit-password" ]]; then
+            status_pass "permit_root_login" "$CONF_PERMIT_ROOT_LOGIN"
+        else
+            status_fail "permit_root_login" \
+                "PermitRootLogin is '${CONF_PERMIT_ROOT_LOGIN}'  expected: no or prohibit-password"
+        fi
+        return
+    fi
+    local cur="${CONF_PERMIT_ROOT_LOGIN,,}"
+    [[ "$cur" == "no" || "$cur" == "prohibit-password" ]] && return
+    _propose "permit_root_login" "PermitRootLogin" "$CONF_PERMIT_ROOT_LOGIN" "no" \
+        "Direct root login increases blast radius if a key is ever compromised"
+}
+
+detect_empty_passwords() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_EMPTY_PASSWORDS,,}" == "no" ]] \
+            && status_pass "permit_empty_passwords" \
+            || status_fail "permit_empty_passwords" \
+                "currently: ${CONF_EMPTY_PASSWORDS}  expected: no"
+        return
+    fi
+    [[ "${CONF_EMPTY_PASSWORDS,,}" == "no" ]] && return
+    _propose "empty_passwords" "PermitEmptyPasswords" "$CONF_EMPTY_PASSWORDS" "no" \
+        "Accounts with empty passwords could be accessed without any credential"
+}
+
+detect_max_auth_tries() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _cur="$CONF_MAX_AUTH_TRIES"
+        if [[ "$_cur" =~ ^[0-9]+$ ]] && (( _cur <= 5 )); then
+            status_pass "max_auth_tries" "${_cur} (≤5)"
+        else
+            status_fail "max_auth_tries" "currently: ${_cur}  expected: ≤5"
+        fi
+        return
+    fi
+    local cur="$CONF_MAX_AUTH_TRIES"
+    [[ "$cur" =~ ^[0-9]+$ ]] && (( cur <= 5 )) && return
+    _propose "max_auth_tries" "MaxAuthTries" "$cur" "3" \
+        "High limit lets attackers try many keys per connection (recommended: 3–5)"
+}
+
+detect_login_grace_time() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _cur="$CONF_LOGIN_GRACE_TIME"
+        if [[ "$_cur" =~ ^[0-9]+$ ]] && (( _cur > 0 && _cur <= 60 )); then
+            status_pass "login_grace_time" "${_cur}s (≤60)"
+        else
+            status_fail "login_grace_time" "currently: ${_cur}s  expected: 1–60"
+        fi
+        return
+    fi
+    local cur="$CONF_LOGIN_GRACE_TIME"
+    [[ "$cur" =~ ^[0-9]+$ ]] && (( cur > 0 && cur <= 60 )) && return
+    _propose "login_grace_time" "LoginGraceTime" "$cur" "30" \
+        "Long grace period lets unauthenticated connections tie up sshd slots"
+}
+
+detect_idle_timeout() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        local _iv="$CONF_ALIVE_INTERVAL" _ic="$CONF_ALIVE_COUNT"
+        if [[ "$_iv" =~ ^[0-9]+$ && "$_ic" =~ ^[0-9]+$ ]] \
+            && (( _iv > 0 && _ic > 0 )); then
+            local _mins=$(( (_iv * _ic + 59) / 60 ))
+            status_pass "idle_timeout" "~${_mins}min (${_iv}s × ${_ic})"
+        else
+            status_fail "idle_timeout" \
+                "ClientAliveInterval=${_iv}  ClientAliveCountMax=${_ic}  expected: both >0"
+        fi
+        return
+    fi
+    local iv="$CONF_ALIVE_INTERVAL" ic="$CONF_ALIVE_COUNT"
+    [[ "$iv" =~ ^[0-9]+$ && "$ic" =~ ^[0-9]+$ ]] && (( iv > 0 && ic > 0 )) && return
+    _propose "idle_timeout" "ClientAlive (timeout)" \
+        "Interval=${iv} Count=${ic}" "Interval=300 Count=2" \
+        "Idle sessions stay open indefinitely — ~10min timeout recommended"
+}
+
+detect_x11_forwarding() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_X11_FORWARDING,,}" == "no" ]] \
+            && status_pass "x11_forwarding" \
+            || status_fail "x11_forwarding" "currently: ${CONF_X11_FORWARDING}  expected: no"
+        return
+    fi
+    [[ "${CONF_X11_FORWARDING,,}" == "no" ]] && return
+    _propose "x11_forwarding" "X11Forwarding" "$CONF_X11_FORWARDING" "no" \
+        "Exposes the server's X display and can allow session hijacking"
+}
+
+detect_tcp_forwarding() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "${CONF_TCP_FORWARDING,,}" == "no" ]] \
+            && status_pass "tcp_forwarding" \
+            || status_fail "tcp_forwarding" "currently: ${CONF_TCP_FORWARDING}  expected: no"
+        return
+    fi
+    [[ "${CONF_TCP_FORWARDING,,}" == "no" ]] && return
+    _propose "tcp_forwarding" "AllowTcpForwarding" "$CONF_TCP_FORWARDING" "no" \
+        "Enables port-forwarding and SOCKS proxying through this host"
+}
+
+detect_algorithms() {
+    if [[ "$STATUS_MODE" == "true" ]]; then
+        [[ "$CONF_SET_ALGORITHMS" == "true" ]] \
+            && status_pass "algorithms" \
+            || status_fail "algorithms" "no explicit algorithm stanzas in drop-in"
+        return
+    fi
+    [[ "$CONF_SET_ALGORITHMS" == "true" ]] && return
+    _propose "algorithms" "Crypto algorithms" "(none set explicitly)" \
+        "ed25519, rsa-sha2-*, chacha20, aes-gcm, etm MACs" \
+        "Locks in the modern cipher/kex set; prevents regression after upgrades"
+}
+
+# ── detect_issues ──────────────────────────────────────────────────────────────
+# Runs all detectors; populates PROP_* arrays.
+detect_issues() {
+    detect_pubkey_auth
+    detect_password_auth
+    detect_kbd_auth
+    detect_permit_root_login
+    detect_empty_passwords
+    detect_max_auth_tries
+    detect_login_grace_time
+    detect_idle_timeout
+    detect_x11_forwarding
+    detect_tcp_forwarding
+    detect_algorithms
+}
+
+# ── show_proposed_changes ──────────────────────────────────────────────────────
+# Prints a numbered table of all proposed fixes.
+show_proposed_changes() {
+    local n="${#PROP_ID[@]}"
+    if [[ "$n" -eq 0 ]]; then return; fi
+
+    local w_name=32 w_cur=24 w_tgt=32
+    local div_n    div_name    div_cur    div_tgt
+    printf -v div_n    '%*s' 3       ''; div_n="${div_n// /─}"
+    printf -v div_name '%*s' $w_name ''; div_name="${div_name// /─}"
+    printf -v div_cur  '%*s' $w_cur  ''; div_cur="${div_cur// /─}"
+    printf -v div_tgt  '%*s' $w_tgt  ''; div_tgt="${div_tgt// /─}"
+
+    printf "\n    ${BOLD}%-3s  %-${w_name}s %-${w_cur}s %s${NC}\n" \
+        "#" "Setting" "Current" "Proposed"
+    printf "    %s  %s %s %s\n" "$div_n" "$div_name" "$div_cur" "$div_tgt"
+
+    local i
+    for i in "${!PROP_ID[@]}"; do
+        local accepted="${PROP_ACCEPTED[$i]}"
+        local marker color
+        if [[ "$accepted" == "true" ]]; then
+            marker="✓"; color="$GREEN"
+        else
+            marker="✗"; color="$RED"
+        fi
+        printf "    ${color}%-3s${NC}  ${BOLD}%-${w_name}s${NC} ${RED}%-${w_cur}s${NC} ${GREEN}%s${NC}\n" \
+            "${marker} $((i+1))" \
+            "${PROP_NAME[$i]}" \
+            "${PROP_CURRENT[$i]}" \
+            "${PROP_TARGET[$i]}"
+        printf "         ${DIM}%s${NC}\n" "${PROP_REASON[$i]}"
+    done
+    printf '\n'
+}
+
+# ── review_proposed_changes ────────────────────────────────────────────────────
+# Shows the proposed-fix table, then lets the user:
+#   [A]ccept all  — accept every proposed change as-is
+#   [R]eview      — step through each fix, with option to edit the target value
+#   [N]one        — reject all changes
+review_proposed_changes() {
+    local n="${#PROP_ID[@]}"
+    if [[ "$n" -eq 0 ]]; then
+        ok "No issues detected — nothing to propose."
+        return
+    fi
+
+    header "Proposed Changes"
+    show_proposed_changes
+
+    # Warn about lockout risk when password auth would be disabled without a key
+    local has_pwd_fix=false
+    local i
+    for i in "${!PROP_ID[@]}"; do
+        [[ "${PROP_ID[$i]}" == "password_auth" ]] && has_pwd_fix=true && break
+    done
+    if [[ "$has_pwd_fix" == "true" ]] && ! sudo_ssh_user_exists; then
+        printf '\n'
+        warn "No non-root sudoer with an SSH key exists on this system."
+        warn "Disabling password auth without one may lock you out."
+        plain "Consider adding a key for a sudo user first (see check_sudo_ssh_user)."
+        printf '\n'
+    fi
+
+    printf "    ${CYAN}[A]${NC}  Accept all proposed changes\n"
+    printf "    ${CYAN}[R]${NC}  Review each change individually\n"
+    printf "    ${CYAN}[N]${NC}  Reject all — make no changes\n"
+    printf '\n'
+
+    local choice
+    while true; do
+        read -rp "    ${YELLOW}>  ${NC}Choice [A/r/n]: " choice || true
+        choice="${choice:-a}"
+        case "${choice,,}" in
+            a)
+                # All already default to accepted=true
+                ok "Accepting all ${n} proposed change(s)."
+                break
+                ;;
+            r)
+                _review_each
+                break
+                ;;
+            n)
+                for i in "${!PROP_ID[@]}"; do
+                    PROP_ACCEPTED[$i]="false"
+                done
+                warn "All changes rejected — sshd configuration will not be modified."
+                break
+                ;;
+            *)
+                warn "Enter A, R, or N."
+                ;;
+        esac
+    done
+}
+
+# ── _review_each ───────────────────────────────────────────────────────────────
+# Steps through each proposed fix; user can accept, edit the target value,
+# or reject each one individually.
+_review_each() {
+    local i n="${#PROP_ID[@]}"
+    printf '\n'
+    info "Reviewing ${n} proposed change(s). Press Enter to accept each, or choose an option."
+    printf '\n'
+
+    for i in "${!PROP_ID[@]}"; do
+        local id="${PROP_ID[$i]}"
+        local name="${PROP_NAME[$i]}"
+        local cur="${PROP_CURRENT[$i]}"
+        local tgt="${PROP_TARGET[$i]}"
+        local reason="${PROP_REASON[$i]}"
+
+        printf "    ${BOLD}── $((i+1))/${n}  ${name}${NC}\n"
+        printf "       ${DIM}%s${NC}\n" "$reason"
+        printf "       Current:  ${RED}%s${NC}\n" "$cur"
+        printf "       Proposed: ${GREEN}%s${NC}\n" "$tgt"
+        printf '\n'
+        printf "       ${CYAN}[Y]${NC}  Accept  "
+        printf "  ${CYAN}[E]${NC}  Edit proposed value  "
+        printf "  ${CYAN}[N]${NC}  Skip\n"
+
+        local item_choice
+        while true; do
+            read -rp "       ${YELLOW}>  ${NC}[Y/e/n]: " item_choice || true
+            item_choice="${item_choice:-y}"
+            case "${item_choice,,}" in
+                y|yes|"")
+                    PROP_ACCEPTED[$i]="true"
+                    ok "  Accepted: ${name} → ${tgt}"
+                    break
+                    ;;
+                e|edit)
+                    local new_val
+                    new_val=$(ask_val "New value for ${name}" "$tgt")
+                    if [[ -z "$new_val" ]]; then
+                        warn "  Value cannot be empty — keeping proposed value '${tgt}'."
+                        PROP_ACCEPTED[$i]="true"
+                    else
+                        PROP_TARGET[$i]="$new_val"
+                        PROP_ACCEPTED[$i]="true"
+                        ok "  Accepted: ${name} → ${new_val}"
+                    fi
+                    break
+                    ;;
+                n|no|skip)
+                    PROP_ACCEPTED[$i]="false"
+                    warn "  Skipped: ${name} remains ${cur}"
+                    break
+                    ;;
+                *)
+                    warn "  Enter Y, E, or N."
+                    ;;
+            esac
+        done
+        printf '\n'
+    done
+
+    # After review, show the final table
+    header "Review Summary"
+    show_proposed_changes
+}
+
+# ── apply_accepted_fixes ──────────────────────────────────────────────────────
+# Translates accepted PROP_* entries into CONF_* variable updates, sets DIRTY.
+apply_accepted_fixes() {
+    local i
+    for i in "${!PROP_ID[@]}"; do
+        [[ "${PROP_ACCEPTED[$i]}" != "true" ]] && continue
+
+        local id="${PROP_ID[$i]}"
+        local tgt="${PROP_TARGET[$i]}"
+        local name="${PROP_NAME[$i]}"
+
+        case "$id" in
+            pubkey_auth)
+                CONF_PUBKEY_AUTH="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("PubkeyAuthentication set to ${tgt}")
+                ;;
+            password_auth)
+                CONF_PASSWORD_AUTH="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("PasswordAuthentication set to ${tgt}")
+                ;;
+            kbd_auth)
+                CONF_KBD_AUTH="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("KbdInteractiveAuthentication set to ${tgt}")
+                ;;
+            permit_root_login)
+                CONF_PERMIT_ROOT_LOGIN="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("PermitRootLogin set to ${tgt}")
+                ;;
+            empty_passwords)
+                CONF_EMPTY_PASSWORDS="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("PermitEmptyPasswords set to ${tgt}")
+                ;;
+            max_auth_tries)
+                CONF_MAX_AUTH_TRIES="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("MaxAuthTries set to ${tgt}")
+                ;;
+            login_grace_time)
+                CONF_LOGIN_GRACE_TIME="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("LoginGraceTime set to ${tgt}s")
+                ;;
+            idle_timeout)
+                # tgt is "Interval=N Count=M" — parse it
+                local iv ic
+                iv=$(printf '%s' "$tgt" | grep -oP '(?<=Interval=)\d+')
+                ic=$(printf '%s' "$tgt" | grep -oP '(?<=Count=)\d+')
+                CONF_ALIVE_INTERVAL="${iv:-300}"
+                CONF_ALIVE_COUNT="${ic:-2}"
+                DIRTY=true
+                CHECKS_FIXED+=("Idle timeout set to ${CONF_ALIVE_INTERVAL}s × ${CONF_ALIVE_COUNT}")
+                ;;
+            x11_forwarding)
+                CONF_X11_FORWARDING="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("X11Forwarding set to ${tgt}")
+                ;;
+            tcp_forwarding)
+                CONF_TCP_FORWARDING="$tgt"
+                DIRTY=true
+                CHECKS_FIXED+=("AllowTcpForwarding set to ${tgt}")
+                ;;
+            algorithms)
+                CONF_SET_ALGORITHMS=true
+                DIRTY=true
+                CHECKS_FIXED+=("Modern algorithm stanzas added")
+                ;;
+        esac
+    done
+
+    # Collect declined items
+    for i in "${!PROP_ID[@]}"; do
+        [[ "${PROP_ACCEPTED[$i]}" == "false" ]] || continue
+        CHECKS_DECLINED+=("${PROP_NAME[$i]} not changed (skipped)")
+    done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# check_sudo_ssh_user — interactive key-provisioning pre-condition
+# Unchanged from original (no detection-mode needed; doesn't write sshd config)
+# ══════════════════════════════════════════════════════════════════════════════
+
 check_sudo_ssh_user() {
     if [[ "$STATUS_MODE" == "true" ]]; then
         if sudo_ssh_user_exists; then
@@ -535,7 +954,6 @@ check_sudo_ssh_user() {
     plain "key-based sudo user in place, you risk losing all SSH access."
     printf '\n'
 
-    # Build list of eligible sudo members (non-root, must exist in passwd)
     local sudo_users=() sudo_homes=()
     while IFS= read -r _m; do
         [[ -z "$_m" || "$_m" == "root" ]] && continue
@@ -558,7 +976,6 @@ check_sudo_ssh_user() {
         return 0
     fi
 
-    # Pick which sudo user to add a key for
     printf '\n'
     local dv; printf -v dv '%*s' 50 ''; printf "    %s\n" "${dv// /─}"
     printf "    ${BOLD}%-4s %-18s %s${NC}\n" "#" "Username" "Home"
@@ -601,7 +1018,6 @@ check_sudo_ssh_user() {
 
     local auth_file="${key_home}/.ssh/authorized_keys"
 
-    # Key source loop — URL / paste
     if [[ "$URL_FETCH_AVAILABLE" == "true" ]]; then
         info "Tip: GitHub and GitLab expose all your keys at one URL:"
         plain "  https://github.com/USERNAME.keys   or   https://gitlab.com/USERNAME.keys"
@@ -712,380 +1128,7 @@ check_sudo_ssh_user() {
     fi
 }
 
-check_pubkey_auth() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        if [[ "${CONF_PUBKEY_AUTH,,}" == "yes" ]]; then
-            status_pass "pubkey_auth"
-        else
-            status_fail "pubkey_auth" \
-                "PubkeyAuthentication is '${CONF_PUBKEY_AUTH}'  expected: yes"
-        fi
-        return 0
-    fi
-
-    local cur="${CONF_PUBKEY_AUTH,,}"
-    if [[ "$cur" == "yes" ]]; then
-        ok "PubkeyAuthentication is yes"
-        CHECKS_PASSED+=("PubkeyAuthentication yes")
-        return 0
-    fi
-
-    printf '\n'
-    warn "PubkeyAuthentication is '${CONF_PUBKEY_AUTH}' — should be 'yes'."
-    plain "Without this, key-based login is disabled and you cannot lock out passwords safely."
-
-    if ask "Set PubkeyAuthentication yes?" "y"; then
-        CONF_PUBKEY_AUTH="yes"
-        DIRTY=true
-        CHECKS_FIXED+=("PubkeyAuthentication set to yes")
-    else
-        warn "Skipped — PubkeyAuthentication remains ${CONF_PUBKEY_AUTH}."
-        CHECKS_DECLINED+=("PubkeyAuthentication not enabled (risk accepted)")
-    fi
-}
-
-check_password_auth() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        if [[ "${CONF_PASSWORD_AUTH,,}" == "no" ]]; then
-            status_pass "password_auth"
-        else
-            status_fail "password_auth" \
-                "PasswordAuthentication is '${CONF_PASSWORD_AUTH}'  expected: no"
-        fi
-        return 0
-    fi
-
-    local cur="${CONF_PASSWORD_AUTH,,}"
-    if [[ "$cur" == "no" ]]; then
-        ok "PasswordAuthentication is no"
-        CHECKS_PASSED+=("PasswordAuthentication no")
-        return 0
-    fi
-
-    printf '\n'
-    warn "PasswordAuthentication is '${CONF_PASSWORD_AUTH}' — should be 'no'."
-    plain "Password auth exposes the server to brute-force attacks."
-    plain "Ensure at least one authorized key is in place before disabling passwords."
-
-    # Safety: warn if no non-root sudoer has a key (lockout risk)
-    if ! sudo_ssh_user_exists; then
-        printf '\n'
-        warn "No non-root sudoer with an SSH key exists on this system."
-        warn "Disabling password auth without one may lock you out."
-        plain "Run manage-ssh.sh to add a key for a sudo user first."
-    fi
-
-    if ask "Set PasswordAuthentication no?" "y"; then
-        CONF_PASSWORD_AUTH="no"
-        DIRTY=true
-        CHECKS_FIXED+=("PasswordAuthentication set to no")
-    else
-        warn "Skipped — PasswordAuthentication remains ${CONF_PASSWORD_AUTH}."
-        CHECKS_DECLINED+=("PasswordAuthentication not disabled (risk accepted)")
-    fi
-}
-
-check_kbd_auth() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        if [[ "${CONF_KBD_AUTH,,}" == "no" ]]; then
-            status_pass "kbd_auth"
-        else
-            status_fail "kbd_auth" \
-                "KbdInteractiveAuthentication is '${CONF_KBD_AUTH}'  expected: no"
-        fi
-        return 0
-    fi
-
-    local cur="${CONF_KBD_AUTH,,}"
-    if [[ "$cur" == "no" ]]; then
-        ok "KbdInteractiveAuthentication is no"
-        CHECKS_PASSED+=("KbdInteractiveAuthentication no")
-        return 0
-    fi
-
-    printf '\n'
-    warn "KbdInteractiveAuthentication is '${CONF_KBD_AUTH}' — should be 'no'."
-    plain "This is the modern replacement for ChallengeResponseAuthentication."
-    plain "Leaving it enabled can allow password-style prompts even when PasswordAuthentication is off."
-
-    if ask "Set KbdInteractiveAuthentication no?" "y"; then
-        CONF_KBD_AUTH="no"
-        DIRTY=true
-        CHECKS_FIXED+=("KbdInteractiveAuthentication set to no")
-    else
-        warn "Skipped — KbdInteractiveAuthentication remains ${CONF_KBD_AUTH}."
-        CHECKS_DECLINED+=("KbdInteractiveAuthentication not disabled (risk accepted)")
-    fi
-}
-
-check_permit_root_login() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        local _cur="${CONF_PERMIT_ROOT_LOGIN,,}"
-        if [[ "$_cur" == "no" || "$_cur" == "prohibit-password" ]]; then
-            status_pass "permit_root_login" "$CONF_PERMIT_ROOT_LOGIN"
-        else
-            status_fail "permit_root_login" \
-                "PermitRootLogin is '${CONF_PERMIT_ROOT_LOGIN}'  expected: no or prohibit-password"
-        fi
-        return 0
-    fi
-
-    local cur="${CONF_PERMIT_ROOT_LOGIN,,}"
-    if [[ "$cur" == "no" || "$cur" == "prohibit-password" ]]; then
-        ok "PermitRootLogin is ${CONF_PERMIT_ROOT_LOGIN}"
-        CHECKS_PASSED+=("PermitRootLogin ${CONF_PERMIT_ROOT_LOGIN}")
-        return 0
-    fi
-
-    printf '\n'
-    warn "PermitRootLogin is '${CONF_PERMIT_ROOT_LOGIN}' — should be 'no' or 'prohibit-password'."
-    plain "Direct root login increases blast radius if a key is compromised."
-    plain "Recommended: log in as a normal user and use sudo."
-
-    if ask "Set PermitRootLogin no?" "y"; then
-        CONF_PERMIT_ROOT_LOGIN="no"
-        DIRTY=true
-        CHECKS_FIXED+=("PermitRootLogin set to no")
-    else
-        warn "Skipped — PermitRootLogin remains ${CONF_PERMIT_ROOT_LOGIN}."
-        CHECKS_DECLINED+=("PermitRootLogin not restricted (risk accepted)")
-    fi
-}
-
-check_empty_passwords() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        [[ "${CONF_EMPTY_PASSWORDS,,}" == "no" ]] \
-            && status_pass "permit_empty_passwords" \
-            || status_fail "permit_empty_passwords" \
-                "currently: ${CONF_EMPTY_PASSWORDS}  expected: no"
-        return 0
-    fi
-
-    local cur="${CONF_EMPTY_PASSWORDS,,}"
-    if [[ "$cur" == "no" ]]; then
-        ok "PermitEmptyPasswords is no"
-        CHECKS_PASSED+=("PermitEmptyPasswords no")
-        return 0
-    fi
-
-    printf '\n'
-    warn "PermitEmptyPasswords is '${CONF_EMPTY_PASSWORDS}' — should be 'no'."
-    plain "Accounts with empty passwords could be logged into over SSH without any credential."
-
-    if ask "Set PermitEmptyPasswords no?" "y"; then
-        CONF_EMPTY_PASSWORDS="no"
-        DIRTY=true
-        CHECKS_FIXED+=("PermitEmptyPasswords set to no")
-    else
-        warn "Skipped — PermitEmptyPasswords remains ${CONF_EMPTY_PASSWORDS}."
-        CHECKS_DECLINED+=("PermitEmptyPasswords not restricted (risk accepted)")
-    fi
-}
-
-check_max_auth_tries() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        local _cur="$CONF_MAX_AUTH_TRIES"
-        if [[ "$_cur" =~ ^[0-9]+$ ]] && (( _cur <= 5 )); then
-            status_pass "max_auth_tries" "${_cur} (≤5)"
-        else
-            status_fail "max_auth_tries" "currently: ${_cur}  expected: ≤5"
-        fi
-        return 0
-    fi
-
-    local cur="$CONF_MAX_AUTH_TRIES"
-    if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur <= 5 )); then
-        ok "MaxAuthTries is ${cur}"
-        CHECKS_PASSED+=("MaxAuthTries ${cur} (≤5)")
-        return 0
-    fi
-
-    printf '\n'
-    warn "MaxAuthTries is '${cur}' — recommended ≤5."
-    plain "A high limit lets attackers try many keys per connection before the connection drops."
-    plain "Set to 3–5; clients with many keys can still connect, just not in a single attempt."
-
-    if ask "Set MaxAuthTries 3?" "y"; then
-        CONF_MAX_AUTH_TRIES="3"
-        DIRTY=true
-        CHECKS_FIXED+=("MaxAuthTries set to 3")
-    else
-        warn "Skipped — MaxAuthTries remains ${cur}."
-        CHECKS_DECLINED+=("MaxAuthTries not reduced (risk accepted)")
-    fi
-}
-
-check_login_grace_time() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        local _cur="$CONF_LOGIN_GRACE_TIME"
-        if [[ "$_cur" =~ ^[0-9]+$ ]] && (( _cur > 0 && _cur <= 60 )); then
-            status_pass "login_grace_time" "${_cur}s (≤60)"
-        else
-            status_fail "login_grace_time" "currently: ${_cur}s  expected: 1–60"
-        fi
-        return 0
-    fi
-
-    local cur="$CONF_LOGIN_GRACE_TIME"
-    if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur > 0 && cur <= 60 )); then
-        ok "LoginGraceTime is ${cur}s"
-        CHECKS_PASSED+=("LoginGraceTime ${cur}s (≤60)")
-        return 0
-    fi
-
-    printf '\n'
-    warn "LoginGraceTime is '${cur}' — recommended 30–60s."
-    plain "A long grace period lets unauthenticated connections tie up sshd slots."
-
-    if ask "Set LoginGraceTime 30?" "y"; then
-        CONF_LOGIN_GRACE_TIME="30"
-        DIRTY=true
-        CHECKS_FIXED+=("LoginGraceTime set to 30s")
-    else
-        warn "Skipped — LoginGraceTime remains ${cur}."
-        CHECKS_DECLINED+=("LoginGraceTime not tightened (risk accepted)")
-    fi
-}
-
-check_idle_timeout() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        local _iv="$CONF_ALIVE_INTERVAL" _ic="$CONF_ALIVE_COUNT"
-        if [[ "$_iv" =~ ^[0-9]+$ && "$_ic" =~ ^[0-9]+$ ]] \
-            && (( _iv > 0 && _ic > 0 )); then
-            local _mins=$(( (_iv * _ic + 59) / 60 ))
-            status_pass "idle_timeout" "~${_mins}min (${_iv}s × ${_ic})"
-        else
-            status_fail "idle_timeout" \
-                "ClientAliveInterval=${_iv}  ClientAliveCountMax=${_ic}  expected: both >0"
-        fi
-        return 0
-    fi
-
-    local iv="$CONF_ALIVE_INTERVAL" ic="$CONF_ALIVE_COUNT"
-    if [[ "$iv" =~ ^[0-9]+$ && "$ic" =~ ^[0-9]+$ ]] \
-        && (( iv > 0 && ic > 0 )); then
-        local mins=$(( (iv * ic + 59) / 60 ))
-        ok "Idle timeout: ${iv}s × ${ic} missed = ~${mins}min"
-        CHECKS_PASSED+=("Idle timeout active (~${mins}min)")
-        return 0
-    fi
-
-    printf '\n'
-    warn "Idle timeout is disabled (ClientAliveInterval=${iv}, ClientAliveCountMax=${ic})."
-    plain "Idle sessions stay open indefinitely — a risk if a workstation is left unattended."
-    plain "Recommended: 300s × 2 = sessions drop after ~10 minutes of inactivity."
-
-    if ask "Enable idle timeout (300s × 2)?" "y"; then
-        CONF_ALIVE_INTERVAL="300"
-        CONF_ALIVE_COUNT="2"
-        DIRTY=true
-        CHECKS_FIXED+=("Idle timeout set to 300s × 2 (~10min)")
-    else
-        warn "Skipped — idle timeout remains disabled."
-        CHECKS_DECLINED+=("Idle timeout not enabled (risk accepted)")
-    fi
-}
-
-check_x11_forwarding() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        [[ "${CONF_X11_FORWARDING,,}" == "no" ]] \
-            && status_pass "x11_forwarding" \
-            || status_fail "x11_forwarding" "currently: ${CONF_X11_FORWARDING}  expected: no"
-        return 0
-    fi
-
-    local cur="${CONF_X11_FORWARDING,,}"
-    if [[ "$cur" == "no" ]]; then
-        ok "X11Forwarding is no"
-        CHECKS_PASSED+=("X11Forwarding no")
-        return 0
-    fi
-
-    printf '\n'
-    warn "X11Forwarding is '${CONF_X11_FORWARDING}' — should be 'no'."
-    plain "X11 forwarding exposes the server's display and can allow session hijacking."
-    plain "Disable unless you specifically need to forward graphical applications over SSH."
-
-    if ask "Set X11Forwarding no?" "y"; then
-        CONF_X11_FORWARDING="no"
-        DIRTY=true
-        CHECKS_FIXED+=("X11Forwarding set to no")
-    else
-        warn "Skipped — X11Forwarding remains ${CONF_X11_FORWARDING}."
-        CHECKS_DECLINED+=("X11Forwarding not disabled (risk accepted)")
-    fi
-}
-
-check_tcp_forwarding() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        [[ "${CONF_TCP_FORWARDING,,}" == "no" ]] \
-            && status_pass "tcp_forwarding" \
-            || status_fail "tcp_forwarding" "currently: ${CONF_TCP_FORWARDING}  expected: no"
-        return 0
-    fi
-
-    local cur="${CONF_TCP_FORWARDING,,}"
-    if [[ "$cur" == "no" ]]; then
-        ok "AllowTcpForwarding is no"
-        CHECKS_PASSED+=("AllowTcpForwarding no")
-        return 0
-    fi
-
-    printf '\n'
-    warn "AllowTcpForwarding is '${CONF_TCP_FORWARDING}' — should be 'no'."
-    plain "TCP forwarding enables port-forwarding and SOCKS proxying through this host."
-    plain "Disable unless you actively rely on these features."
-
-    if ask "Set AllowTcpForwarding no?" "y"; then
-        CONF_TCP_FORWARDING="no"
-        DIRTY=true
-        CHECKS_FIXED+=("AllowTcpForwarding set to no")
-    else
-        warn "Skipped — AllowTcpForwarding remains ${CONF_TCP_FORWARDING}."
-        CHECKS_DECLINED+=("AllowTcpForwarding not disabled (risk accepted)")
-    fi
-}
-
-check_algorithms() {
-    if [[ "$STATUS_MODE" == "true" ]]; then
-        [[ "$CONF_SET_ALGORITHMS" == "true" ]] \
-            && status_pass "algorithms" \
-            || status_fail "algorithms" "no explicit algorithm stanzas in drop-in"
-        return 0
-    fi
-
-    if [[ "$CONF_SET_ALGORITHMS" == "true" ]]; then
-        ok "Explicit modern algorithm stanzas are present in the drop-in"
-        CHECKS_PASSED+=("Modern algorithms explicitly configured")
-        return 0
-    fi
-
-    printf '\n'
-    warn "No explicit algorithm configuration found."
-    plain "OpenSSH's defaults are reasonable on current versions, but do not disable"
-    plain "legacy options on older systems. Writing explicit stanzas locks in the"
-    plain "modern set and prevents regressions after package upgrades."
-    plain ""
-    plain "The following will be written:"
-    plain "  HostKeyAlgorithms    ssh-ed25519, rsa-sha2-512, rsa-sha2-256"
-    plain "  PubkeyAcceptedAlgos  ssh-ed25519, sk-ssh-ed25519, rsa-sha2-512, rsa-sha2-256"
-    plain "  KexAlgorithms        curve25519-sha256, diffie-hellman-group16-sha512, …"
-    plain "  Ciphers              chacha20-poly1305, aes256-gcm, aes128-gcm"
-    plain "  MACs                 hmac-sha2-256-etm, hmac-sha2-512-etm"
-
-    if ask "Write modern algorithm stanzas?" "y"; then
-        CONF_SET_ALGORITHMS=true
-        DIRTY=true
-        CHECKS_FIXED+=("Modern algorithm stanzas added")
-    else
-        warn "Skipped — algorithm configuration left to OpenSSH defaults."
-        CHECKS_DECLINED+=("Algorithm stanzas not written (risk accepted)")
-    fi
-}
-
 # ── apply_fixes ───────────────────────────────────────────────────────────────
-# Writes the hardening drop-in, validates with sshd -t, reloads.
-# Restores previous config automatically on validation failure.
 apply_fixes() {
     section "Writing Hardening Drop-in"
     printf '\n'
@@ -1113,7 +1156,6 @@ apply_fixes() {
 
     mkdir -p /etc/ssh/sshd_config.d
 
-    # Back up existing drop-in
     local ts; ts=$(date '+%Y%m%d_%H%M%S')
     local bak="${SSHD_DROP_IN}.bak.${ts}"
     if [[ -f "$SSHD_DROP_IN" ]]; then
@@ -1121,7 +1163,6 @@ apply_fixes() {
         ok "Backed up existing drop-in → ${bak}"
     fi
 
-    # Build optional algorithm block
     local algo_block=""
     if [[ "$CONF_SET_ALGORITHMS" == "true" ]]; then
         algo_block=$(cat << 'ALGEOF'
@@ -1137,7 +1178,6 @@ ALGEOF
 )
     fi
 
-    # Compute idle timeout comment
     local idle_comment
     if (( CONF_ALIVE_INTERVAL > 0 && CONF_ALIVE_COUNT > 0 )); then
         local _mins=$(( (CONF_ALIVE_INTERVAL * CONF_ALIVE_COUNT + 59) / 60 ))
@@ -1146,7 +1186,6 @@ ALGEOF
         idle_comment="idle timeout disabled"
     fi
 
-    # Write the drop-in
     cat > "$SSHD_DROP_IN" << DROPIN
 # ── SSH Hardening drop-in ─────────────────────────────────────────────────────
 # Written by harden-ssh.sh on $(date)
@@ -1190,7 +1229,6 @@ UseDNS no
 ${algo_block}
 DROPIN
 
-    # Validate before reloading
     if sshd -t 2>/tmp/harden_ssh_sshd_test.err; then
         systemctl reload ssh 2>/dev/null \
             || systemctl reload sshd 2>/dev/null \
@@ -1220,23 +1258,25 @@ main() {
     preflight_checks
     compute_state
 
+    # ── --status mode ──────────────────────────────────────────────────────────
     if [[ "$STATUS_MODE" == "true" ]]; then
         check_sudo_ssh_user
-        check_pubkey_auth
-        check_password_auth
-        check_kbd_auth
-        check_permit_root_login
-        check_empty_passwords
-        check_max_auth_tries
-        check_login_grace_time
-        check_idle_timeout
-        check_x11_forwarding
-        check_tcp_forwarding
-        check_algorithms
+        detect_pubkey_auth
+        detect_password_auth
+        detect_kbd_auth
+        detect_permit_root_login
+        detect_empty_passwords
+        detect_max_auth_tries
+        detect_login_grace_time
+        detect_idle_timeout
+        detect_x11_forwarding
+        detect_tcp_forwarding
+        detect_algorithms
         _emit_status
         [[ ${#STATUS_FAIL[@]} -eq 0 ]] && exit 0 || exit 1
     fi
 
+    # ── Banner ─────────────────────────────────────────────────────────────────
     printf '\n'
     printf "${BLUE}${BOLD}  ┌─────────────────────────────────────────────────────┐${NC}\n"
     printf "${BLUE}${BOLD}  │                    harden-ssh.sh                    │${NC}\n"
@@ -1245,13 +1285,10 @@ main() {
     printf "  OS:       ${BOLD}%s %s (%s)${NC}\n"   "$OS_ID" "$OS_CODENAME" "$OS_VERSION_ID"
     printf "  Dry-run:  ${BOLD}%s${NC}\n\n"         "$DRY_RUN"
 
-    # Show current effective configuration
     header "Current SSH Configuration"
     show_state
 
     # ── Pre-condition: ensure a non-root sudoer has an SSH key ────────────────
-    # Runs unconditionally — even on a fully-hardened system this check must
-    # not be skipped, because the all-pass exit below would otherwise hide it.
     section "Pre-condition Check"
     printf '\n'
     check_sudo_ssh_user
@@ -1262,39 +1299,44 @@ main() {
         if [[ -f "$SSHD_DROP_IN" ]]; then
             plain "Drop-in: ${SSHD_DROP_IN}"
         fi
-        # Still print summary so the sudo key outcome is visible
         printf '\n'
         printf "  ${BOLD}Summary${NC}\n\n"
         for msg in "${CHECKS_PASSED[@]+"${CHECKS_PASSED[@]}"}"; do
             printf "  ${GREEN}  ✓${NC}  %s\n" "$msg"
         done
-        for msg in "${CHECKS_FIXED[@]+"${CHECKS_FIXED[@]}"}"; do
-            printf "  ${CYAN}  ~${NC}  %s\n" "$msg"
-        done
-        for msg in "${CHECKS_DECLINED[@]+"${CHECKS_DECLINED[@]}"}"; do
-            printf "  ${YELLOW}  !${NC}  %s\n" "$msg"
-        done
         printf '\n'
         exit 0
     fi
 
-    # ── Run checks ────────────────────────────────────────────────────────────
-    section "Hardening Checks"
-    printf '\n'
-    info "Press Enter to accept the recommended fix, or answer n to skip each check."
-    printf '\n'
+    # ── Detect all issues, then let the user review them in bulk ─────────────
+    detect_issues
 
-    check_pubkey_auth
-    check_password_auth
-    check_kbd_auth
-    check_permit_root_login
-    check_empty_passwords
-    check_max_auth_tries
-    check_login_grace_time
-    check_idle_timeout
-    check_x11_forwarding
-    check_tcp_forwarding
-    check_algorithms
+    # Record already-passing checks for the summary
+    local already_passing=(
+        "pubkey_auth:PubkeyAuthentication"
+        "password_auth:PasswordAuthentication"
+        "kbd_auth:KbdInteractiveAuthentication"
+        "permit_root_login:PermitRootLogin"
+        "empty_passwords:PermitEmptyPasswords"
+        "max_auth_tries:MaxAuthTries"
+        "login_grace_time:LoginGraceTime"
+        "idle_timeout:ClientAlive idle timeout"
+        "x11_forwarding:X11Forwarding"
+        "tcp_forwarding:AllowTcpForwarding"
+        "algorithms:Crypto algorithms"
+    )
+    for entry in "${already_passing[@]}"; do
+        local chk_id="${entry%%:*}" chk_name="${entry#*:}"
+        local found=false
+        local pi
+        for pi in "${!PROP_ID[@]}"; do
+            [[ "${PROP_ID[$pi]}" == "$chk_id" ]] && found=true && break
+        done
+        [[ "$found" == "false" ]] && CHECKS_PASSED+=("${chk_name} — already hardened")
+    done
+
+    review_proposed_changes
+    apply_accepted_fixes
 
     # ── Apply accepted fixes ──────────────────────────────────────────────────
     printf '\n'
@@ -1306,7 +1348,6 @@ main() {
 
     # ── Final state ───────────────────────────────────────────────────────────
     if [[ "$DIRTY" == "true" && "$DRY_RUN" != "true" ]]; then
-        # Re-read effective values now that the drop-in has been written
         compute_state
         header "Updated SSH Configuration"
         show_state
@@ -1314,7 +1355,6 @@ main() {
 
     # ── Summary ───────────────────────────────────────────────────────────────
     printf "  ${BOLD}Summary${NC}\n\n"
-
     for msg in "${CHECKS_PASSED[@]+"${CHECKS_PASSED[@]}"}"; do
         printf "  ${GREEN}  ✓${NC}  %s\n" "$msg"
     done
